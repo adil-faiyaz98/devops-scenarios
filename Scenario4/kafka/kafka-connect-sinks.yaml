@@ -1,0 +1,122 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: kafka-connect-cluster
+  namespace: kafka
+  annotations:
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 3.3.1
+  replicas: 3
+  bootstrapServers: kafka-cluster-kafka-bootstrap:9092
+  image: quay.io/strimzi/kafka:0.32.0-kafka-3.3.1
+  config:
+    group.id: connect-cluster
+    offset.storage.topic: connect-cluster-offsets
+    config.storage.topic: connect-cluster-configs
+    status.storage.topic: connect-cluster-status
+    config.storage.replication.factor: 3
+    offset.storage.replication.factor: 3
+    status.storage.replication.factor: 3
+    key.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: false
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 500m
+    limits:
+      memory: 2Gi
+      cpu: 1000m
+  jvmOptions:
+    -Xms: 1G
+    -Xmx: 1G
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: kafka-connect-metrics
+        key: metrics-config.yml
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: prometheus-sink-connector
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-connect-cluster
+spec:
+  class: io.confluent.connect.prometheus.PrometheusMetricsSinkConnector
+  tasksMax: 3
+  config:
+    topics: telemetry-metrics
+    prometheus.server.url: "http://prometheus-server.observability.svc.cluster.local:9090"
+    prometheus.metric.prefix: "kafka_"
+    prometheus.metric.type.override: "true"
+    prometheus.metric.type.override.file: "/opt/kafka/metric-type-overrides.properties"
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: "false"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: s3-sink-connector
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-connect-cluster
+spec:
+  class: io.confluent.connect.s3.S3SinkConnector
+  tasksMax: 3
+  config:
+    topics: telemetry-metrics,telemetry-traces,telemetry-logs
+    s3.region: us-east-1
+    s3.bucket.name: ecommerce-telemetry-archive
+    topics.dir: telemetry
+    flush.size: 10000
+    rotate.interval.ms: 300000  # 5 minutes
+    storage.class: io.confluent.connect.s3.storage.S3Storage
+    format.class: io.confluent.connect.s3.format.json.JsonFormat
+    partitioner.class: io.confluent.connect.storage.partitioner.TimeBasedPartitioner
+    path.format: "'year'=YYYY/'month'=MM/'day'=dd/'hour'=HH"
+    locale: en-US
+    timezone: UTC
+    timestamp.extractor: RecordField
+    timestamp.field: timestamp
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: "false"
+    aws.access.key.id: ${file:/opt/kafka/external-configuration/aws-credentials/aws-access-key-id:aws.access.key.id}
+    aws.secret.access.key: ${file:/opt/kafka/external-configuration/aws-credentials/aws-secret-access-key:aws.secret.access.key}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: elasticsearch-sink-connector
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-connect-cluster
+spec:
+  class: io.confluent.connect.elasticsearch.ElasticsearchSinkConnector
+  tasksMax: 3
+  config:
+    topics: telemetry-logs
+    connection.url: https://elasticsearch-master.observability.svc.cluster.local:9200
+    connection.username: ${file:/opt/kafka/external-configuration/es-credentials/username:username}
+    connection.password: ${file:/opt/kafka/external-configuration/es-credentials/password:password}
+    type.name: _doc
+    key.ignore: "true"
+    schema.ignore: "true"
+    behavior.on.malformed.documents: warn
+    drop.invalid.message: "false"
+    write.method: upsert
+    max.buffered.records: 20000
+    batch.size: 2000
+    max.in.flight.requests: 5
+    linger.ms: 1000
+    max.retries: 5
+    retry.backoff.ms: 1000
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: "false"

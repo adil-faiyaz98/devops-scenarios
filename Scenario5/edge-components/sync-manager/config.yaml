@@ -1,0 +1,38 @@
+sync:
+  # Local caching configuration
+  cache:
+    enabled: true
+    max_size_gb: 5
+    retention_days: 7
+    
+  # Offline mode configuration
+  offline:
+    enabled: true
+    max_retry_attempts: 5
+    retry_interval: 300
+    
+  # P2P sync configuration
+  peer_sync:
+    enabled: true
+    max_peers: 5
+    discovery_method: "mdns"
+    
+  # Progressive deployment
+  deployment:
+    strategy: "canary"
+    phases:
+      - percentage: 5
+        duration: "1h"
+      - percentage: 25
+        duration: "2h"
+      - percentage: 50
+        duration: "4h"
+      - percentage: 100
+        duration: "6h"
+    
+  # Health checks
+  health_check:
+    interval: 30
+    timeout: 5
+    healthy_threshold: 3
+    unhealthy_threshold: 2

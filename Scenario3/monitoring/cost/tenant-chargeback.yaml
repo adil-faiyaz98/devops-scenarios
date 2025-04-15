@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenant-chargeback-config
+  namespace: kubecost
+data:
+  config.json: |
+    {
+      "tenants": [
+        {
+          "name": "team-a",
+          "namespaces": ["team-a"],
+          "labels": {
+            "team": "team-a",
+            "department": "engineering"
+          },
+          "costCenter": "CC001",
+          "billingAccount": "BA001"
+        },
+        {
+          "name": "team-b",
+          "namespaces": ["team-b"],
+          "labels": {
+            "team": "team-b",
+            "department": "marketing"
+          },
+          "costCenter": "CC002",
+          "billingAccount": "BA002"
+        },
+        {
+          "name": "team-c",
+          "namespaces": ["team-c"],
+          "labels": {
+            "team": "team-c",
+            "department": "finance"
+          },
+          "costCenter": "CC003",
+          "billingAccount": "BA003"
+        }
+      ],
+      "reportingSchedule": {
+        "daily": {
+          "enabled": true,
+          "hour": 6,
+          "recipients": ["platform-team@company.com"]
+        },
+        "weekly": {
+          "enabled": true,
+          "day": "Monday",
+          "hour": 8,
+          "recipients": ["platform-team@company.com", "finance@company.com"]
+        },
+        "monthly": {
+          "enabled": true,
+          "day": 1,
+          "hour": 8,
+          "recipients": ["platform-team@company.com", "finance@company.com", "management@company.com"]
+        }
+      },
+      "allocationRules": {
+        "sharedCosts": {
+          "enabled": true,
+          "services": ["monitoring", "logging", "ingress-nginx", "cert-manager"],
+          "allocationMethod": "proportional"
+        },
+        "idleResources": {
+          "enabled": true,
+          "allocationMethod": "proportional"
+        }
+      }
+    }

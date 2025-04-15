@@ -1,0 +1,77 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: kubecost
+  namespace: cattle-system
+spec:
+  chart: cost-analyzer
+  repo: https://kubecost.github.io/cost-analyzer/
+  targetNamespace: kubecost
+  valuesContent: |-
+    global:
+      prometheus:
+        enabled: true
+        fqdn: http://prometheus-server.monitoring.svc.cluster.local
+
+    kubecostModel:
+      enabled: true
+      resources:
+        requests:
+          cpu: 200m
+          memory: 55Mi
+        limits:
+          cpu: 800m
+          memory: 256Mi
+
+    prometheus:
+      nodeExporter:
+        enabled: true
+      serviceAccounts:
+        nodeExporter:
+          create: true
+
+    grafana:
+      sidecar:
+        dashboards:
+          enabled: true
+
+    cloudProvider:
+      aws:
+        enabled: true
+        spotLabel: "node.kubernetes.io/instance-type"
+        spotLabelValue: "spot"
+
+    networkCosts:
+      enabled: true
+      prometheusScrapeInterval: 60s
+
+    reporting:
+      productAnalytics: true
+      errorReporting: true
+
+    notifications:
+      slack:
+        enabled: true
+        webhook: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+        channel: "#kubecost-alerts"
+      
+      email:
+        enabled: true
+        to:
+          - "devops@company.com"
+          - "finance@company.com"
+
+    savings:
+      spotRecommendations: true
+      rightSizing: true
+      notifications:
+        threshold: 50
+        minChange: 100
+
+    clusters:
+      - name: production
+        enabled: true
+        priority: 1
+      - name: staging
+        enabled: true
+        priority: 2

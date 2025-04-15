@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-rbac-config
+  namespace: observability
+data:
+  rbac.yaml: |
+    apiVersion: 1
+    
+    # Organization roles
+    roles:
+      - name: "SRE"
+        description: "Site Reliability Engineer role with full access"
+        permissions:
+          - action: "dashboards:create"
+            scope: "dashboards:*"
+          - action: "dashboards:write"
+            scope: "dashboards:*"
+          - action: "dashboards:delete"
+            scope: "dashboards:*"
+          - action: "folders:create"
+            scope: "folders:*"
+          - action: "folders:write"
+            scope: "folders:*"
+          - action: "folders:delete"
+            scope: "folders:*"
+          - action: "datasources:query"
+            scope: "datasources:*"
+          - action: "datasources:create"
+            scope: "datasources:*"
+          - action: "datasources:write"
+            scope: "datasources:*"
+          - action: "datasources:delete"
+            scope: "datasources:*"
+          - action: "org.users:add"
+            scope: "users:*"
+          - action: "org.users:write"
+            scope: "users:*"
+          - action: "org.users:read"
+            scope: "users:*"
+          - action: "alert.rules:create"
+            scope: "alert.rules:*"
+          - action: "alert.rules:write"
+            scope: "alert.rules:*"
+          - action: "alert.rules:delete"
+            scope: "alert.rules:*"
+          - action: "alert.instances:read"
+            scope: "alert.instances:*"
+          - action: "alert.instances:update"
+            scope: "alert.instances:*"
+      
+      - name: "Developer"
+        description: "Developer role with limited access"
+        permissions:
+          - action: "dashboards:read"
+            scope: "dashboards:*"
+          - action: "dashboards:write"
+            scope: "dashboards:uid:*;folder:Development"
+          - action: "folders:read"
+            scope: "folders:*"
+          - action: "datasources:query"
+            scope: "datasources:*"
+          - action: "alert.rules:read"
+            scope: "alert.rules:*"
+          - action: "alert.instances:read"
+            scope: "alert.instances:*"
+      
+      - name: "BusinessAnalyst"
+        description: "Business Analyst role with access to business dashboards"
+        permissions:
+          - action: "dashboards:read"
+            scope: "dashboards:*;folder:Business"
+          - action: "folders:read"
+            scope: "folders:uid:Business"
+          - action: "datasources:query"
+            scope: "datasources:*"
+      
+      - name: "ReadOnly"
+        description: "Read-only role for all dashboards"
+        permissions:
+          - action: "dashboards:read"
+            scope: "dashboards:*"
+          - action: "folders:read"
+            scope: "folders:*"
+          - action: "datasources:query"
+            scope: "datasources:*"
+    
+    # Team assignments
+    teams:
+      - name: "SRE Team"
+        org_id: 1
+        folder_permissions:
+          - folder_uid: "*"
+            permissions:
+              - action: "dashboards:create"
+                permission: "Edit"
+              - action: "dashboards:write"
+                permission: "Edit"
+              - action: "dashboards:delete"
+                permission: "Edit"
+              - action: "folders:create"
+                permission: "Edit"
+              - action: "folders:write"
+                permission: "Edit"
+              - action: "folders:delete"
+                permission: "Edit"
+      
+      - name: "Development Team"
+        org_id: 1
+        folder_permissions:
+          - folder_uid: "Development"
+            permissions:
+              - action: "dashboards:read"
+                permission: "View"
+              - action: "dashboards:write"
+                permission: "Edit"
+              - action: "folders:read"
+                permission: "View"
+          - folder_uid: "SRE"
+            permissions:
+              - action: "dashboards:read"
+                permission: "View"
+              - action: "folders:read"
+                permission: "View"
+      
+      - name: "Business Team"
+        org_id: 1
+        folder_permissions:
+          - folder_uid: "Business"
+            permissions:
+              - action: "dashboards:read"
+                permission: "View"
+              - action: "folders:read"
+                permission: "View"
+    
+    # User assignments
+    users:
+      - login: "admin"
+        role: "Admin"
+      
+      - login: "sre-user"
+        role: "SRE"
+      
+      - login: "dev-user"
+        role: "Developer"
+      
+      - login: "business-user"
+        role: "BusinessAnalyst"
+      
+      - login: "readonly-user"
+        role: "ReadOnly"

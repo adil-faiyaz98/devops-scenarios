@@ -1,0 +1,296 @@
+# Kubernetes Deployment Configuration for Microservices
+# This template can be used for each microservice in the project
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SERVICE_NAME}  # Will be replaced with actual service name
+  namespace: ${NAMESPACE}  # Will be replaced with environment namespace
+  labels:
+    app: ${SERVICE_NAME}
+    project: ${PROJECT_NAME}
+    environment: ${ENVIRONMENT}
+spec:
+  # Ensure high availability with multiple replicas
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ${SERVICE_NAME}
+      project: ${PROJECT_NAME}
+  # Configure zero-downtime deployment strategy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Ensures zero downtime during updates
+  template:
+    metadata:
+      labels:
+        app: ${SERVICE_NAME}
+        project: ${PROJECT_NAME}
+        environment: ${ENVIRONMENT}
+      annotations:
+        # Enable Prometheus metrics scraping
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Record deployment information for traceability
+        kubernetes.io/change-cause: "Deployed version ${IMAGE_TAG} at $(date)"
+    spec:
+      # Security context for the pod
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+      containers:
+      - name: ${SERVICE_NAME}
+        image: ${REGISTRY}/${PROJECT_NAME}/${SERVICE_NAME}:${IMAGE_TAG}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        # Resource limits to ensure proper scheduling and performance
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1
+            memory: 1Gi
+        # Environment variables
+        env:
+        - name: NODE_ENV
+          value: "${ENVIRONMENT}"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: TRACING_ENABLED
+          value: "true"
+        # Database connection details from ConfigMap
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: ${SERVICE_NAME}-config
+              key: db.host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: ${SERVICE_NAME}-config
+              key: db.port
+        # Sensitive information from Secrets
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: ${SERVICE_NAME}-db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ${SERVICE_NAME}-db-credentials
+              key: password
+        # API keys and other sensitive data
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ${SERVICE_NAME}-api-credentials
+              key: api-key
+        # Health checks for zero-downtime deployments
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        # Startup probe for slow-starting applications
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 30
+        # Security context for the container
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        # Mount volumes for configuration and data
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: log-volume
+          mountPath: /app/logs
+      # Initialize with proper permissions
+      initContainers:
+      - name: init-permissions
+        image: busybox
+        command: ['sh', '-c', 'chmod -R 755 /app/logs && chown -R 1000:1000 /app/logs']
+        volumeMounts:
+        - name: log-volume
+          mountPath: /app/logs
+      # Volumes for the pod
+      volumes:
+      - name: config-volume
+        configMap:
+          name: ${SERVICE_NAME}-config
+      - name: tmp-volume
+        emptyDir: {}
+      - name: log-volume
+        emptyDir: {}
+      # Pull secrets for private container registry
+      imagePullSecrets:
+      - name: registry-credentials
+      # Node affinity for proper scheduling
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ${SERVICE_NAME}
+              topologyKey: "kubernetes.io/hostname"
+      # Tolerations for node taints
+      tolerations:
+      - key: "node-role.kubernetes.io/general"
+        operator: "Exists"
+        effect: "NoSchedule"
+---
+# Service for the microservice
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${SERVICE_NAME}
+    project: ${PROJECT_NAME}
+    environment: ${ENVIRONMENT}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: ${SERVICE_NAME}
+    project: ${PROJECT_NAME}
+---
+# Horizontal Pod Autoscaler for automatic scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ${SERVICE_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${SERVICE_NAME}
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+      selectPolicy: Max
+---
+# Network Policy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${SERVICE_NAME}-network-policy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: ${SERVICE_NAME}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ${NAMESPACE}
+    - podSelector:
+        matchLabels:
+          role: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: ${NAMESPACE}
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443

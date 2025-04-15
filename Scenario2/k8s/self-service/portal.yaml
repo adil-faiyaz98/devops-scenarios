@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: self-service-portal
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: self-service-portal
+  template:
+    spec:
+      containers:
+      - name: portal
+        image: self-service-portal:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-token
+              key: token
+        - name: JENKINS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: jenkins-token
+              key: token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: self-service-portal
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 3000
+  selector:
+    app: self-service-portal

@@ -1,0 +1,402 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-config
+  namespace: observability
+data:
+  grafana.ini: |
+    [server]
+    domain = grafana.example.com
+    root_url = https://grafana.example.com
+    
+    [auth]
+    disable_login_form = false
+    oauth_auto_login = false
+    
+    [auth.generic_oauth]
+    enabled = true
+    name = OAuth
+    allow_sign_up = true
+    client_id = ${OAUTH_CLIENT_ID}
+    client_secret = ${OAUTH_CLIENT_SECRET}
+    scopes = openid profile email
+    auth_url = https://auth.example.com/authorize
+    token_url = https://auth.example.com/oauth/token
+    api_url = https://auth.example.com/userinfo
+    role_attribute_path = contains(groups[*], 'admin') && 'Admin' || contains(groups[*], 'editor') && 'Editor' || 'Viewer'
+    
+    [users]
+    auto_assign_org_role = Viewer
+    
+    [security]
+    disable_initial_admin_creation = false
+    admin_user = admin
+    admin_password = ${ADMIN_PASSWORD}
+    
+    [dashboards]
+    min_refresh_interval = 10s
+    
+    [alerting]
+    enabled = true
+    execute_alerts = true
+    
+    [unified_alerting]
+    enabled = true
+    
+    [analytics]
+    reporting_enabled = false
+    check_for_updates = false
+    
+    [plugins]
+    enable_alpha = false
+    
+    [feature_toggles]
+    enable = tempoSearch tempoBackendSearch tempoServiceGraph
+
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://thanos-query.observability.svc.cluster.local:10902
+        isDefault: true
+        jsonData:
+          timeInterval: 15s
+          httpMethod: GET
+          exemplarTraceIdDestinations:
+            - name: traceID
+              datasourceUid: tempo
+      
+      - name: Tempo
+        type: tempo
+        access: proxy
+        url: http://tempo-query-frontend.observability.svc.cluster.local:3100
+        jsonData:
+          httpMethod: GET
+          tracesToLogs:
+            datasourceUid: loki
+            tags: ['service.name', 'job']
+            mappedTags: [{ key: 'service.name', value: 'service' }]
+            mapTagNamesEnabled: true
+            spanStartTimeShift: '-1h'
+            spanEndTimeShift: '1h'
+            filterByTraceID: true
+            filterBySpanID: true
+      
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki-gateway.observability.svc.cluster.local:3100
+        jsonData:
+          maxLines: 1000
+          derivedFields:
+            - datasourceUid: tempo
+              matcherRegex: "traceID=(\\w+)"
+              name: TraceID
+              url: "$${__value.raw}"
+              
+      - name: Elasticsearch
+        type: elasticsearch
+        access: proxy
+        url: https://elasticsearch-master.observability.svc.cluster.local:9200
+        database: "[logs-]YYYY.MM.DD"
+        jsonData:
+          timeField: "@timestamp"
+          esVersion: 7.10.0
+          maxConcurrentShardRequests: 5
+          logMessageField: message
+          logLevelField: level
+        secureJsonData:
+          basicAuth: true
+          basicAuthUser: ${ES_USERNAME}
+          basicAuthPassword: ${ES_PASSWORD}
+
+  dashboardproviders.yaml: |
+    apiVersion: 1
+    providers:
+      - name: 'default'
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/default
+      
+      - name: 'sre'
+        orgId: 1
+        folder: 'SRE'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/sre
+      
+      - name: 'dev'
+        orgId: 1
+        folder: 'Development'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/dev
+      
+      - name: 'business'
+        orgId: 1
+        folder: 'Business'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/business
+
+  notifiers.yaml: |
+    apiVersion: 1
+    notifiers:
+      - name: Slack SRE
+        type: slack
+        uid: slack-sre
+        org_id: 1
+        is_default: true
+        settings:
+          url: ${SLACK_SRE_WEBHOOK_URL}
+          recipient: "#sre-alerts"
+          mentionChannel: here
+          username: Grafana Alerting
+          icon_emoji: ":grafana:"
+          token: ${SLACK_API_TOKEN}
+      
+      - name: PagerDuty
+        type: pagerduty
+        uid: pagerduty-main
+        org_id: 1
+        is_default: false
+        settings:
+          integrationKey: ${PAGERDUTY_INTEGRATION_KEY}
+          severity: critical
+          autoResolve: true
+      
+      - name: Email
+        type: email
+        uid: email-alerts
+        org_id: 1
+        is_default: false
+        settings:
+          addresses: alerts@example.com
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-secrets
+  namespace: observability
+type: Opaque
+data:
+  admin-password: YWRtaW4xMjM=  # base64 encoded "admin123"
+  oauth-client-id: Z3JhZmFuYS1jbGllbnQ=  # base64 encoded "grafana-client"
+  oauth-client-secret: c2VjcmV0MTIz  # base64 encoded "secret123"
+  slack-sre-webhook-url: aHR0cHM6Ly9ob29rcy5zbGFjay5jb20vc2VydmljZXMvVDAxMjM0NTY3L0IwMTIzNDU2Ny9hYmNkZWYxMjM0NTY3ODkw  # base64 encoded webhook URL
+  slack-api-token: eG94Yi0xMjM0LTU2Nzg5MA==  # base64 encoded "xoxb-1234-567890"
+  pagerduty-integration-key: MTIzNDU2Nzg5MGFiY2RlZg==  # base64 encoded "1234567890abcdef"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        fsGroup: 472
+        supplementalGroups:
+          - 0
+      containers:
+        - name: grafana
+          image: grafana/grafana:9.3.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http-grafana
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /api/health
+              port: 3000
+              scheme: HTTP
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 3000
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: admin-password
+            - name: GF_PATHS_CONFIG
+              value: /etc/grafana/grafana.ini
+            - name: GF_PATHS_DATA
+              value: /var/lib/grafana
+            - name: GF_PATHS_HOME
+              value: /usr/share/grafana
+            - name: GF_PATHS_LOGS
+              value: /var/log/grafana
+            - name: GF_PATHS_PLUGINS
+              value: /var/lib/grafana/plugins
+            - name: GF_PATHS_PROVISIONING
+              value: /etc/grafana/provisioning
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: oauth-client-id
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: oauth-client-secret
+            - name: SLACK_SRE_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: slack-sre-webhook-url
+            - name: SLACK_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: slack-api-token
+            - name: PAGERDUTY_INTEGRATION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: pagerduty-integration-key
+            - name: ES_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: elasticsearch-credentials
+                  key: username
+            - name: ES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: elasticsearch-credentials
+                  key: password
+          volumeMounts:
+            - mountPath: /etc/grafana/grafana.ini
+              name: grafana-config
+              subPath: grafana.ini
+            - mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+              name: grafana-config
+              subPath: datasources.yaml
+            - mountPath: /etc/grafana/provisioning/dashboards/dashboardproviders.yaml
+              name: grafana-config
+              subPath: dashboardproviders.yaml
+            - mountPath: /etc/grafana/provisioning/notifiers/notifiers.yaml
+              name: grafana-config
+              subPath: notifiers.yaml
+            - mountPath: /var/lib/grafana
+              name: grafana-storage
+            - mountPath: /var/lib/grafana/dashboards/default
+              name: grafana-dashboards-default
+            - mountPath: /var/lib/grafana/dashboards/sre
+              name: grafana-dashboards-sre
+            - mountPath: /var/lib/grafana/dashboards/dev
+              name: grafana-dashboards-dev
+            - mountPath: /var/lib/grafana/dashboards/business
+              name: grafana-dashboards-business
+      volumes:
+        - name: grafana-config
+          configMap:
+            name: grafana-config
+        - name: grafana-storage
+          persistentVolumeClaim:
+            claimName: grafana-pvc
+        - name: grafana-dashboards-default
+          configMap:
+            name: grafana-dashboards-default
+        - name: grafana-dashboards-sre
+          configMap:
+            name: grafana-dashboards-sre
+        - name: grafana-dashboards-dev
+          configMap:
+            name: grafana-dashboards-dev
+        - name: grafana-dashboards-business
+          configMap:
+            name: grafana-dashboards-business
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: observability
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  ports:
+    - port: 3000
+      protocol: TCP
+      targetPort: http-grafana
+  selector:
+    app: grafana
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: observability
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+    - hosts:
+        - grafana.example.com
+      secretName: grafana-tls
+  rules:
+    - host: grafana.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000

@@ -1,0 +1,245 @@
+name: Edge Platform CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'edge-components/**'
+      - 'infrastructure/**'
+      - 'monitoring/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      deployment_type:
+        description: 'Deployment Type'
+        required: true
+        type: choice
+        options:
+          - full
+          - components-only
+          - infrastructure-only
+
+env:
+  TF_VERSION: '1.5.7'
+  KUBECTL_VERSION: '1.27.3'
+  AWS_REGION: 'us-west-2'
+  AZURE_REGION: 'eastus'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Terraform Format Check
+        run: |
+          cd infrastructure/terraform
+          terraform fmt -check -recursive
+
+      - name: Validate Kubernetes Manifests
+        uses: kubernetes-sigs/kubeval-action@v1
+        with:
+          files: gitops/argocd/applications
+
+      - name: Run Edge Component Tests
+        run: |
+          cd edge-components
+          go test ./... -v
+
+  security-scan:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Trivy for Infrastructure
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'infrastructure'
+          exit-code: '1'
+
+      - name: Run KICS Scanner
+        uses: checkmarx/kics-github-action@v1
+        with:
+          path: '.'
+          config_path: '.kics/config.yml'
+          fail_on: high
+
+  infrastructure-deployment:
+    needs: security-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init and Apply
+        run: |
+          cd infrastructure/terraform/environments/${{ github.event.inputs.environment || 'dev' }}
+          terraform init
+          terraform apply -auto-approve
+
+  components-deployment:
+    needs: infrastructure-deployment
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up ArgoCD CLI
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+
+      - name: Deploy Edge Components
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} --username ${{ secrets.ARGOCD_USERNAME }} --password ${{ secrets.ARGOCD_PASSWORD }}
+          argocd app create edge-components \
+            --repo ${{ github.repository }} \
+            --path gitops/argocd/applications \
+            --dest-server https://kubernetes.default.svc \
+            --dest-namespace edge-system \
+            --sync-policy automated
+
+  monitoring:
+    needs: components-deployment
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy Monitoring Stack
+        run: |
+          # Deploy monitoring components
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --values monitoring/prometheus-values.yaml
+          
+          # Deploy logging stack
+          helm upgrade --install elastic elastic/elasticsearch \
+            --namespace logging \
+            --values monitoring/elastic-values.yaml
+          
+          # Deploy tracing
+          helm upgrade --install jaeger jaegertracing/jaeger \
+            --namespace tracing \
+            --values monitoring/jaeger-values.yaml
+
+  verification:
+    needs: monitoring
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Verify Edge Components
+        run: |
+          ./scripts/verify-deployment.sh
+          ./scripts/run-integration-tests.sh
+
+      - name: Verify Monitoring
+        run: |
+          ./scripts/verify-monitoring.sh
+
+  testing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unit Tests
+        run: |
+          cd edge-components
+          go test -v -race -coverprofile=coverage.txt ./...
+        
+      - name: Integration Tests
+        run: |
+          ./scripts/run-integration-tests.sh
+        
+      - name: Performance Tests
+        run: |
+          k6 run ./performance-tests/edge-load-test.js
+        
+      - name: Security Tests
+        run: |
+          owasp-zap-baseline.py -t https://edge-api.dev
+
+  performance:
+    steps:
+      - name: Load Testing
+        run: |
+          k6 run ./performance/load-tests.js
+        
+      - name: Stress Testing
+        run: |
+          apache-jmeter -n -t ./performance/stress-test.jmx
+        
+      - name: Resource Usage Analysis
+        run: |
+          ./scripts/analyze-resource-usage.sh
+
+  artifact-management:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and Push Container
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+      - name: Sign Container Image
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v1.13.1'
+    
+      - name: Push Signed Image
+        run: |
+          cosign sign ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  compliance:
+    steps:
+      - name: Compliance Check
+        run: |
+          # Run CIS benchmark tests
+          kube-bench run --config kube-bench/config.yaml
+          
+          # Check for SOC2 compliance
+          ./scripts/soc2-compliance-check.sh
+          
+          # Generate audit logs
+          ./scripts/generate-audit-report.sh
+
+
+
+
+

@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tenant-alerts
+  namespace: ${TENANT_NAMESPACE}
+spec:
+  groups:
+    - name: tenant.rules
+      rules:
+        - alert: TenantResourceQuotaExceeded
+          expr: namespace:container_cpu_usage:sum{namespace="${TENANT_NAMESPACE}"} > namespace:resource_quota:cpu{namespace="${TENANT_NAMESPACE}"}
+          for: 15m
+          labels:
+            severity: warning
+            tenant: ${TENANT_NAME}

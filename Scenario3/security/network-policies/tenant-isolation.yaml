@@ -1,0 +1,24 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: tenant-isolation
+  namespace: ${TENANT_NAMESPACE}
+spec:
+  selector: all()
+  types:
+  - Ingress
+  - Egress
+  ingress:
+  - action: Allow
+    source:
+      namespaceSelector: name == "${TENANT_NAMESPACE}"
+  - action: Allow
+    source:
+      namespaceSelector: name in {"istio-system", "monitoring", "logging"}
+  egress:
+  - action: Allow
+    destination:
+      namespaceSelector: name == "${TENANT_NAMESPACE}"
+  - action: Allow
+    destination:
+      namespaceSelector: name in {"istio-system", "monitoring", "logging"}

@@ -1,0 +1,207 @@
+# Prometheus Alert Rules for Enterprise Microservices
+# These rules define when alerts should be triggered based on metrics
+
+groups:
+- name: availability-alerts
+  rules:
+  # Service availability alerts
+  - alert: ServiceDown
+    expr: up{job="kubernetes-pods"} == 0
+    for: 1m
+    labels:
+      severity: critical
+      team: platform
+    annotations:
+      summary: "Service {{ $labels.service }} is down"
+      description: "Service {{ $labels.service }} in namespace {{ $labels.kubernetes_namespace }} has been down for more than 1 minute."
+      runbook_url: "https://runbooks.example.com/service_down.md"
+
+  # High error rate alerts
+  - alert: HighErrorRate
+    expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (service, kubernetes_namespace) / sum(rate(http_requests_total[5m])) by (service, kubernetes_namespace) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+      team: application
+    annotations:
+      summary: "High error rate on {{ $labels.service }}"
+      description: "Service {{ $labels.service }} in namespace {{ $labels.kubernetes_namespace }} has a 5xx error rate above 5% for 5 minutes."
+      runbook_url: "https://runbooks.example.com/high_error_rate.md"
+
+  # API endpoint availability
+  - alert: APIEndpointDown
+    expr: probe_success{job="blackbox"} == 0
+    for: 5m
+    labels:
+      severity: critical
+      team: application
+    annotations:
+      summary: "API endpoint {{ $labels.instance }} is down"
+      description: "API endpoint {{ $labels.instance }} has been down for more than 5 minutes."
+      runbook_url: "https://runbooks.example.com/api_endpoint_down.md"
+
+- name: performance-alerts
+  rules:
+  # High latency alerts
+  - alert: HighLatency
+    expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (service, kubernetes_namespace, le)) > 0.5
+    for: 5m
+    labels:
+      severity: warning
+      team: application
+    annotations:
+      summary: "High latency on {{ $labels.service }}"
+      description: "Service {{ $labels.service }} in namespace {{ $labels.kubernetes_namespace }} has a 95th percentile latency above 500ms for 5 minutes."
+      runbook_url: "https://runbooks.example.com/high_latency.md"
+
+  # High CPU usage
+  - alert: HighCPUUsage
+    expr: sum(rate(container_cpu_usage_seconds_total{container!=""}[5m])) by (container, pod, namespace) / sum(container_spec_cpu_quota{container!=""}/container_spec_cpu_period{container!=""}) by (container, pod, namespace) > 0.8
+    for: 10m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "High CPU usage on {{ $labels.container }}"
+      description: "Container {{ $labels.container }} in pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has CPU usage above 80% for 10 minutes."
+      runbook_url: "https://runbooks.example.com/high_cpu_usage.md"
+
+  # High memory usage
+  - alert: HighMemoryUsage
+    expr: sum(container_memory_working_set_bytes{container!=""}) by (container, pod, namespace) / sum(container_spec_memory_limit_bytes{container!=""}) by (container, pod, namespace) > 0.8
+    for: 10m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "High memory usage on {{ $labels.container }}"
+      description: "Container {{ $labels.container }} in pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has memory usage above 80% for 10 minutes."
+      runbook_url: "https://runbooks.example.com/high_memory_usage.md"
+
+  # Disk space running out
+  - alert: DiskSpaceRunningOut
+    expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 10
+    for: 5m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "Disk space running out on {{ $labels.instance }}"
+      description: "Node {{ $labels.instance }} has less than 10% free disk space on {{ $labels.mountpoint }}."
+      runbook_url: "https://runbooks.example.com/disk_space.md"
+
+- name: scaling-alerts
+  rules:
+  # Pod scaling issues
+  - alert: HorizontalPodAutoscalerMaxed
+    expr: kube_horizontalpodautoscaler_status_current_replicas{job="kube-state-metrics"} == kube_horizontalpodautoscaler_spec_max_replicas{job="kube-state-metrics"}
+    for: 15m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "HPA maxed out for {{ $labels.horizontalpodautoscaler }}"
+      description: "HorizontalPodAutoscaler {{ $labels.horizontalpodautoscaler }} in namespace {{ $labels.namespace }} has been running at max replicas for 15 minutes."
+      runbook_url: "https://runbooks.example.com/hpa_maxed.md"
+
+  # Pod pending
+  - alert: KubePodPending
+    expr: kube_pod_status_phase{phase="Pending"} == 1
+    for: 15m
+    labels:
+      severity: warning
+      team: platform
+    annotations:
+      summary: "Pod {{ $labels.pod }} pending"
+      description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been in pending state for more than 15 minutes."
+      runbook_url: "https://runbooks.example.com/pod_pending.md"
+
+- name: database-alerts
+  rules:
+  # Database connection pool saturation
+  - alert: DatabaseConnectionPoolSaturation
+    expr: sum(db_connections_current) by (database) / sum(db_connections_max) by (database) > 0.8
+    for: 5m
+    labels:
+      severity: warning
+      team: database
+    annotations:
+      summary: "Database connection pool nearing saturation for {{ $labels.database }}"
+      description: "Database {{ $labels.database }} connection pool is above 80% capacity for 5 minutes."
+      runbook_url: "https://runbooks.example.com/db_connection_pool.md"
+
+  # High database CPU
+  - alert: HighDatabaseCPU
+    expr: rate(pg_stat_activity_count{state="active"}[5m]) > 20
+    for: 5m
+    labels:
+      severity: warning
+      team: database
+    annotations:
+      summary: "High number of active connections on {{ $labels.instance }}"
+      description: "PostgreSQL instance {{ $labels.instance }} has more than 20 active connections for 5 minutes."
+      runbook_url: "https://runbooks.example.com/high_db_connections.md"
+
+- name: slo-alerts
+  rules:
+  # SLO breach for availability
+  - alert: SLOAvailabilityBreach
+    expr: (1 - (sum(rate(http_requests_total{status=~"5.."}[1h])) / sum(rate(http_requests_total[1h])))) * 100 < 99.9
+    for: 5m
+    labels:
+      severity: critical
+      team: sre
+    annotations:
+      summary: "SLO breach: Service availability below 99.9%"
+      description: "Service availability has dropped below the SLO target of 99.9% over the last hour."
+      runbook_url: "https://runbooks.example.com/slo_availability_breach.md"
+
+  # SLO breach for latency
+  - alert: SLOLatencyBreach
+    expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1h])) by (le)) > 0.3
+    for: 5m
+    labels:
+      severity: critical
+      team: sre
+    annotations:
+      summary: "SLO breach: 95th percentile latency above 300ms"
+      description: "The 95th percentile latency has exceeded the SLO target of 300ms over the last hour."
+      runbook_url: "https://runbooks.example.com/slo_latency_breach.md"
+
+- name: security-alerts
+  rules:
+  # Container running as root
+  - alert: ContainerRunningAsRoot
+    expr: container_spec_security_context_run_as_user{container!=""} == 0
+    for: 5m
+    labels:
+      severity: warning
+      team: security
+    annotations:
+      summary: "Container {{ $labels.container }} running as root"
+      description: "Container {{ $labels.container }} in pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is running as root user."
+      runbook_url: "https://runbooks.example.com/container_as_root.md"
+
+  # Pod with privileged container
+  - alert: PrivilegedContainer
+    expr: kube_pod_container_info{container!=""}
+    for: 5m
+    labels:
+      severity: warning
+      team: security
+    annotations:
+      summary: "Privileged container {{ $labels.container }}"
+      description: "Container {{ $labels.container }} in pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is running in privileged mode."
+      runbook_url: "https://runbooks.example.com/privileged_container.md"
+
+  # Unusual network traffic
+  - alert: UnusualNetworkTraffic
+    expr: sum(rate(container_network_transmit_bytes_total{namespace!="kube-system"}[5m])) by (pod, namespace) > 100 * 1024 * 1024
+    for: 15m
+    labels:
+      severity: warning
+      team: security
+    annotations:
+      summary: "Unusual network traffic from {{ $labels.pod }}"
+      description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been transmitting more than 100MB/s for 15 minutes."
+      runbook_url: "https://runbooks.example.com/unusual_network_traffic.md"

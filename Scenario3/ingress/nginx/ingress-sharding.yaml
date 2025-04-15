@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingress-sharding-config
+  namespace: ingress-nginx
+data:
+  shard-mapping: |
+    map $host $ingress_class {
+      hostnames;
+      .api1.example.com    "nginx-shard1";
+      .api2.example.com    "nginx-shard2";
+      .api3.example.com    "nginx-shard3";
+      default             "nginx-default";
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress-nginx-controller-shard1
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: controller
+        args:
+        - /nginx-ingress-controller
+        - --ingress-class=nginx-shard1
+        - --watch-ingress-without-class=false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress-nginx-controller-shard2
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: controller
+        args:
+        - /nginx-ingress-controller
+        - --ingress-class=nginx-shard2
+        - --watch-ingress-without-class=false

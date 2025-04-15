@@ -1,0 +1,86 @@
+image: ubuntu:latest
+
+variables:
+  TF_VERSION: "1.5.7"
+  KUBECTL_VERSION: "1.27.3"
+  AWS_REGION: "us-west-2"
+  AZURE_REGION: "eastus"
+
+stages:
+  - validate
+  - security
+  - build
+  - infrastructure
+  - components
+  - monitoring
+  - verify
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+validate:
+  stage: validate
+  script:
+    - cd infrastructure/terraform
+    - terraform fmt -check -recursive
+    - cd ../../edge-components
+    - go test ./... -v
+
+security_scan:
+  stage: security
+  script:
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    - trivy config --exit-code 1 ./infrastructure
+    - trivy config --exit-code 1 ./edge-components
+
+infrastructure_plan:
+  stage: infrastructure
+  script:
+    - cd infrastructure/terraform/environments/${CI_ENVIRONMENT_NAME}
+    - terraform init
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - infrastructure/terraform/environments/${CI_ENVIRONMENT_NAME}/tfplan
+
+infrastructure_apply:
+  stage: infrastructure
+  script:
+    - cd infrastructure/terraform/environments/${CI_ENVIRONMENT_NAME}
+    - terraform apply -auto-approve tfplan
+  dependencies:
+    - infrastructure_plan
+  when: manual
+  only:
+    - main
+
+components_deployment:
+  stage: components
+  script:
+    - argocd login $ARGOCD_SERVER --username $ARGOCD_USERNAME --password $ARGOCD_PASSWORD
+    - argocd app create edge-components-${CI_ENVIRONMENT_NAME} 
+        --repo $CI_PROJECT_URL 
+        --path gitops/argocd/applications 
+        --dest-server https://kubernetes.default.svc 
+        --dest-namespace edge-system-${CI_ENVIRONMENT_NAME} 
+        --sync-policy automated
+  environment:
+    name: ${CI_ENVIRONMENT_NAME}
+
+monitoring_deployment:
+  stage: monitoring
+  script:
+    - kubectl apply -f monitoring/prometheus/
+    - kubectl apply -f monitoring/grafana/
+    - kubectl apply -f monitoring/alertmanager/
+  environment:
+    name: ${CI_ENVIRONMENT_NAME}
+
+verify_deployment:
+  stage: verify
+  script:
+    - ./scripts/verify-deployment.sh
+    - ./scripts/verify-monitoring.sh
+  environment:
+    name: ${CI_ENVIRONMENT_NAME}

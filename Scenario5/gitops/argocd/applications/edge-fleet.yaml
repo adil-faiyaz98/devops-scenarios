@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: edge-fleet
+  namespace: argocd
+spec:
+  project: edge-computing
+  source:
+    repoURL: https://github.com/org/edge-fleet-config.git
+    targetRevision: HEAD
+    path: deployments
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: edge-fleet
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas

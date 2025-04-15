@@ -1,0 +1,46 @@
+import "tfplan/v2" as tfplan
+import "strings"
+
+# Enforce encryption at rest
+enforce_encryption = rule {
+    all tfplan.resource_changes as _, rc {
+        all rc.change.after as _, attr {
+            attr is not "encrypted" or
+            attr.encrypted is true
+        }
+    }
+}
+
+# Enforce MFA
+enforce_mfa = rule {
+    all tfplan.resource_changes as _, rc {
+        rc.type is "aws_iam_user" {
+            rc.change.after.mfa_enabled is true
+        }
+    }
+}
+
+# Enforce VPC Flow Logs
+enforce_vpc_flow_logs = rule {
+    all tfplan.resource_changes as _, rc {
+        rc.type is "aws_vpc" {
+            rc.change.after.enable_flow_logs is true
+        }
+    }
+}
+
+# Enforce FIPS endpoints
+enforce_fips_endpoints = rule {
+    all tfplan.resource_changes as _, rc {
+        rc.type matches "aws_*" {
+            rc.change.after.endpoint contains "fips"
+        }
+    }
+}
+
+main = rule {
+    enforce_encryption and
+    enforce_mfa and
+    enforce_vpc_flow_logs and
+    enforce_fips_endpoints
+}

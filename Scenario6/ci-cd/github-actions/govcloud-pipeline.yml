@@ -1,0 +1,232 @@
+name: GovCloud Infrastructure Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options: ['dev', 'staging', 'prod']
+
+env:
+  TF_VERSION: "1.5.7"
+  PACKER_VERSION: "1.9.4"
+  AWS_REGION: "us-gov-west-1"
+  CHECKOV_VERSION: "2.3.360"
+
+jobs:
+  pre-deployment-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Branch Protection
+        run: |
+          gh api repos/${{ github.repository }}/branches/main/protection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check Required Approvals
+        run: |
+          gh api repos/${{ github.repository }}/branches/main/protection/required_pull_request_reviews
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Security Signatures
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v1.13.1'
+
+  security-compliance-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infrastructure/
+          framework: terraform,kubernetes,dockerfile
+          soft_fail: false
+          output_format: sarif
+          download_external_modules: true
+          config_file: .checkov.yaml
+
+      - name: Run Snyk Infrastructure as Code Scan
+        uses: snyk/actions/iac@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          file: infrastructure/terraform/
+
+      - name: CIS Benchmark Check
+        run: |
+          ./scripts/run-cis-benchmark.sh
+          ./scripts/validate-nist-controls.sh
+
+      - name: SAST Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          languages: ['python', 'javascript', 'go']
+          
+      - name: Run Anchore Container Scan
+        uses: anchore/scan-action@v3
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          fail-build: true
+          severity-cutoff: high
+          
+      - name: Run KICS Scanner
+        uses: checkmarx/kics-github-action@v1.7
+        with:
+          path: infrastructure/
+          config_path: .kics/config.yml
+          output_formats: 'json,sarif'
+
+  image-hardening:
+    needs: security-compliance-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Build Hardened AMI
+        run: |
+          cd infrastructure/packer
+          packer init .
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "environment=${{ github.event.inputs.environment }}" \
+            govcloud-hardened-ami.pkr.hcl
+
+  terraform-plan:
+    needs: image-hardening
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_GOVCLOUD_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_GOVCLOUD_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+          role-session-name: GithubActionsSession
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd infrastructure/terraform
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/terraform
+          terraform plan \
+            -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+            -out=tfplan
+
+      - name: Run Sentinel Policies
+        uses: hashicorp/sentinel-github-actions@v0
+        with:
+          sentinel_version: "0.18.12"
+          config_file: "sentinel/sentinel.hcl"
+
+  deploy:
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Terraform Apply
+        run: |
+          cd infrastructure/terraform
+          terraform apply -auto-approve tfplan
+
+      - name: Verify Compliance
+        run: |
+          ./scripts/verify-fedramp-controls.sh
+          ./scripts/verify-nist-controls.sh
+          ./scripts/verify-audit-logging.sh
+
+      - name: Backup Current State
+        run: |
+          ./scripts/backup-terraform-state.sh
+          ./scripts/snapshot-critical-resources.sh
+          
+      - name: Health Check
+        id: health_check
+        run: |
+          ./scripts/verify-deployment-health.sh
+          
+      - name: Rollback on Failure
+        if: failure() && steps.health_check.outcome == 'failure'
+        run: |
+          ./scripts/initiate-rollback.sh
+          ./scripts/restore-previous-state.sh
+
+  compliance-verification:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: FedRAMP Controls Check
+        run: |
+          ./scripts/verify-fedramp-controls.sh --detailed
+          ./scripts/validate-cmmc-controls.sh
+          ./scripts/verify-nist-800-53.sh
+          
+      - name: Security Boundary Verification
+        run: |
+          ./scripts/verify-network-segmentation.sh
+          ./scripts/validate-data-encryption.sh
+          ./scripts/check-access-controls.sh
+          
+      - name: Audit Configuration
+        run: |
+          ./scripts/verify-cloudtrail-setup.sh
+          ./scripts/validate-guardduty-config.sh
+          ./scripts/check-security-hub.sh
+          
+      - name: Generate Compliance Report
+        run: |
+          ./scripts/generate-compliance-report.sh
+        
+      - name: Upload Compliance Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: compliance-reports
+          path: reports/
+
+  post-deployment:
+    needs: [deploy, security-verification]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load Testing
+        run: |
+          k6 run ./performance/load-tests.js
+          
+      - name: Security Posture Verification
+        run: |
+          ./scripts/verify-security-groups.sh
+          ./scripts/validate-iam-policies.sh
+          ./scripts/check-resource-encryption.sh
+          
+      - name: Compliance Documentation
+        run: |
+          ./scripts/update-compliance-docs.sh
+          ./scripts/generate-audit-report.sh
+          
+      - name: Notify Stakeholders
+        uses: actions/slack-notification@v1
+        with:
+          status: ${{ job.status }}
+          channel: '#govcloud-deployments'

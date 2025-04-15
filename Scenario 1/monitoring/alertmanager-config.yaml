@@ -1,0 +1,253 @@
+# Alertmanager Configuration for Enterprise Microservices
+# This configuration defines how alerts are routed and sent to different notification channels
+
+global:
+  # The smarthost and SMTP sender used for mail notifications
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager'
+  smtp_auth_password: 'password'  # In production, use a secret
+  smtp_require_tls: true
+
+  # The Slack webhook URL
+  slack_api_url: 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'  # In production, use a secret
+
+  # The PagerDuty service key
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+  # Default timeouts
+  resolve_timeout: 5m
+
+# Templates for notifications
+templates:
+  - '/etc/alertmanager/template/*.tmpl'
+
+# The root route on which each incoming alert enters
+route:
+  # The root route must not have any matchers as it is the entry point for all alerts
+  receiver: 'slack-notifications'
+  
+  # Group alerts by alertname, cluster, and service
+  group_by: ['alertname', 'cluster', 'service']
+  
+  # Wait 30 seconds to buffer alerts of the same group before sending
+  group_wait: 30s
+  
+  # Wait 5 minutes before sending a notification about new alerts that are in the same group
+  group_interval: 5m
+  
+  # If an alert has been successfully sent, wait 4 hours before resending
+  repeat_interval: 4h
+
+  # Child routes based on severity and team
+  routes:
+  # Critical alerts go to PagerDuty and Slack
+  - match:
+      severity: critical
+    receiver: 'pagerduty-critical'
+    continue: true  # Continue matching subsequent routes
+
+  # Critical alerts also go to Slack critical channel
+  - match:
+      severity: critical
+    receiver: 'slack-critical'
+    group_wait: 15s  # Faster notification for critical issues
+
+  # Warning alerts go to Slack warnings channel
+  - match:
+      severity: warning
+    receiver: 'slack-warnings'
+
+  # Route alerts to specific teams based on the team label
+  - match:
+      team: platform
+    receiver: 'team-platform'
+    
+  - match:
+      team: application
+    receiver: 'team-application'
+    
+  - match:
+      team: database
+    receiver: 'team-database'
+    
+  - match:
+      team: security
+    receiver: 'team-security'
+    
+  - match:
+      team: sre
+    receiver: 'team-sre'
+
+# Inhibition rules allow suppressing notifications for less severe alerts when a more severe alert is firing
+inhibit_rules:
+  # Suppress warning-level alerts if there's a critical alert with the same alertname, cluster, and service
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'cluster', 'service']
+  
+  # Suppress alerts for individual pods if there's an alert for the whole service
+  - source_match:
+      alertname: 'ServiceDown'
+    target_match:
+      alertname: 'PodNotReady'
+    equal: ['service', 'namespace']
+
+# Receivers define notification integrations
+receivers:
+  # Default Slack receiver for all notifications
+  - name: 'slack-notifications'
+    slack_configs:
+    - channel: '#alerts'
+      send_resolved: true
+      icon_url: 'https://avatars3.githubusercontent.com/u/3380462'
+      title: |-
+        [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        *Service:* {{ .Labels.service }}
+        *Namespace:* {{ .Labels.kubernetes_namespace }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        *Details:*
+          {{ range .Labels.SortedPairs }} • *{{ .Name }}:* `{{ .Value }}`
+          {{ end }}
+        {{ end }}
+
+  # PagerDuty receiver for critical alerts
+  - name: 'pagerduty-critical'
+    pagerduty_configs:
+    - service_key: '0123456789abcdef0123456789abcdef'  # In production, use a secret
+      description: |-
+        [CRITICAL] {{ .CommonLabels.alertname }} - {{ .CommonLabels.service }}
+      client: 'Alertmanager'
+      client_url: 'https://alertmanager.example.com'
+      details:
+        firing: |-
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Service: {{ .Labels.service }}
+          Severity: {{ .Labels.severity }}
+          {{ end }}
+
+  # Slack receiver for critical alerts
+  - name: 'slack-critical'
+    slack_configs:
+    - channel: '#alerts-critical'
+      send_resolved: true
+      icon_url: 'https://avatars3.githubusercontent.com/u/3380462'
+      title: |-
+        [CRITICAL] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        *Service:* {{ .Labels.service }}
+        *Namespace:* {{ .Labels.kubernetes_namespace }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        *Details:*
+          {{ range .Labels.SortedPairs }} • *{{ .Name }}:* `{{ .Value }}`
+          {{ end }}
+        {{ end }}
+
+  # Slack receiver for warning alerts
+  - name: 'slack-warnings'
+    slack_configs:
+    - channel: '#alerts-warnings'
+      send_resolved: true
+      icon_url: 'https://avatars3.githubusercontent.com/u/3380462'
+      title: |-
+        [WARNING] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        *Service:* {{ .Labels.service }}
+        *Namespace:* {{ .Labels.kubernetes_namespace }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        *Details:*
+          {{ range .Labels.SortedPairs }} • *{{ .Name }}:* `{{ .Value }}`
+          {{ end }}
+        {{ end }}
+
+  # Team-specific receivers
+  - name: 'team-platform'
+    slack_configs:
+    - channel: '#team-platform'
+      send_resolved: true
+      title: |-
+        [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        {{ end }}
+
+  - name: 'team-application'
+    slack_configs:
+    - channel: '#team-application'
+      send_resolved: true
+      title: |-
+        [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        {{ end }}
+
+  - name: 'team-database'
+    slack_configs:
+    - channel: '#team-database'
+      send_resolved: true
+      title: |-
+        [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        {{ end }}
+
+  - name: 'team-security'
+    slack_configs:
+    - channel: '#team-security'
+      send_resolved: true
+      title: |-
+        [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        {{ end }}
+
+  - name: 'team-sre'
+    slack_configs:
+    - channel: '#team-sre'
+      send_resolved: true
+      title: |-
+        [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+      text: |-
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+        {{ end }}
+    # Also send SRE alerts to email
+    email_configs:
+    - to: 'sre-team@example.com'
+      send_resolved: true

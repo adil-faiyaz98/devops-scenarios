@@ -1,0 +1,60 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-services-shard1
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout http_502"
+    nginx.ingress.kubernetes.io/load-balance: "ewma"
+spec:
+  ingressClassName: nginx-shard1
+  tls:
+  - hosts:
+    - "*.api1.example.com"
+    secretName: api1-wildcard-tls
+  rules:
+  - host: "services.api1.example.com"
+    http:
+      paths:
+      - path: /payment(/|$)(.*)
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-service
+            port:
+              number: 80
+      - path: /inventory(/|$)(.*)
+        pathType: Prefix
+        backend:
+          service:
+            name: inventory-service
+            port:
+              number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-services-shard2
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx-shard2
+  tls:
+  - hosts:
+    - "*.api2.example.com"
+    secretName: api2-wildcard-tls
+  rules:
+  - host: "services.api2.example.com"
+    http:
+      paths:
+      - path: /users(/|$)(.*)
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80

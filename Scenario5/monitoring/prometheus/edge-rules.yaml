@@ -1,0 +1,32 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: edge-alert-rules
+  namespace: monitoring
+spec:
+  groups:
+    - name: edge.rules
+      rules:
+        - alert: EdgeDeviceOffline
+          expr: up{job="edge-device"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Edge device {{ $labels.device_id }} is offline"
+            
+        - alert: EdgeDeviceHighLatency
+          expr: edge_latency_seconds{quantile="0.9"} > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Edge device {{ $labels.device_id }} experiencing high latency"
+            
+        - alert: EdgeDeviceStorageCritical
+          expr: edge_storage_free_bytes / edge_storage_total_bytes * 100 < 10
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Edge device {{ $labels.device_id }} storage critical"

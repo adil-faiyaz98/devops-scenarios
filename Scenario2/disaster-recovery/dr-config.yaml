@@ -1,0 +1,36 @@
+disaster_recovery:
+  strategy: "active-active"
+  regions:
+    primary:
+      aws: "us-east-1"
+      azure: "eastus"
+    secondary:
+      aws: "us-west-2"
+      azure: "westus2"
+
+  rto_target: "5m"
+  rpo_target: "1m"
+
+  failover:
+    automated: true
+    health_checks:
+      interval: "10s"
+      failure_threshold: 3
+    dns_failover:
+      provider: "route53"
+      health_check_interval: "10s"
+
+  data_replication:
+    databases:
+      type: "synchronous"
+      technology: "native_replication"
+    storage:
+      type: "asynchronous"
+      max_delay: "30s"
+
+  testing:
+    schedule: "monthly"
+    automated_tests:
+      - connectivity
+      - data_consistency
+      - application_health

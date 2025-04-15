@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: edge-analytics-deployment
+spec:
+  strategy:
+    blueGreen:
+      activeService: edge-analytics-active
+      previewService: edge-analytics-preview
+      autoPromotionEnabled: false
+      scaleDownDelaySeconds: 3600
+      prePromotionAnalysis:
+        templates:
+          - templateName: edge-health-check
+        args:
+          - name: service-name
+            value: edge-analytics
+  
+  template:
+    metadata:
+      labels:
+        app: edge-analytics
+    spec:
+      containers:
+        - name: edge-analytics
+          image: edge-analytics:v1
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: vault-token
+              mountPath: /vault/token
+            - name: edge-config
+              mountPath: /etc/edge/config
+      
+      volumes:
+        - name: vault-token
+          secret:
+            secretName: vault-token
+        - name: edge-config
+          configMap:
+            name: edge-config

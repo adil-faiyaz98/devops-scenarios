@@ -1,0 +1,180 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-conf
+  namespace: observability
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      
+      # Receive Prometheus metrics
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'kubernetes-pods'
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                  action: keep
+                  regex: true
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                  action: replace
+                  target_label: __metrics_path__
+                  regex: (.+)
+                - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                  action: replace
+                  regex: ([^:]+)(?::\d+)?;(\d+)
+                  replacement: $1:$2
+                  target_label: __address__
+                - action: labelmap
+                  regex: __meta_kubernetes_pod_label_(.+)
+                - source_labels: [__meta_kubernetes_namespace]
+                  action: replace
+                  target_label: kubernetes_namespace
+                - source_labels: [__meta_kubernetes_pod_name]
+                  action: replace
+                  target_label: kubernetes_pod_name
+      
+      # JMX metrics for Java applications
+      jmx:
+        endpoint: service:jmx:rmi:///jndi/rmi://localhost:5555/jmxrmi
+        target_system: jvm
+        collection_interval: 10s
+        
+      # Custom e-commerce business metrics
+      # These are application-specific metrics exposed via OpenTelemetry SDK
+      # in the e-commerce services
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+      
+      # Add metadata to all telemetry
+      attributes:
+        actions:
+          - key: environment
+            value: ${ENVIRONMENT}
+            action: insert
+          - key: service.version
+            from_attribute: service.version
+            action: upsert
+          - key: deployment.region
+            value: ${REGION}
+            action: insert
+      
+      # Filter out unnecessary data
+      filter:
+        metrics:
+          include:
+            match_type: regexp
+            metric_names:
+              - .*error.*
+              - .*latency.*
+              - .*request.*
+              - .*order.*
+              - .*payment.*
+              - .*inventory.*
+              - .*user.*
+              - .*cart.*
+              - .*checkout.*
+      
+      # Create custom metrics from spans
+      spanmetrics:
+        metrics_exporter: prometheus
+        latency_histogram_buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+        dimensions:
+          - service.name
+          - service.version
+          - http.method
+          - http.status_code
+          - http.route
+      
+      # Add resource detection
+      resourcedetection:
+        detectors: [env, system, gcp, ec2, ecs]
+        timeout: 5s
+
+      # Memory limiter to prevent OOM
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+    exporters:
+      # Export to Prometheus
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        namespace: otel
+        send_timestamps: true
+        metric_expiration: 180m
+      
+      # Export to Kafka
+      kafka:
+        brokers: ${KAFKA_BROKERS}
+        topic: telemetry-metrics
+        encoding: otlp_proto
+        auth:
+          sasl:
+            mechanism: PLAIN
+            username: ${KAFKA_USERNAME}
+            password: ${KAFKA_PASSWORD}
+          tls:
+            insecure: false
+      
+      # Export traces to Jaeger
+      jaeger:
+        endpoint: jaeger-collector.observability.svc.cluster.local:14250
+        tls:
+          insecure: true
+      
+      # Export logs to Elasticsearch
+      elasticsearch:
+        endpoints: ["https://elasticsearch-master.observability.svc.cluster.local:9200"]
+        index: logs-%{service.name}-%{+YYYY.MM.DD}
+        mapping:
+          service.name: keyword
+          service.version: keyword
+        username: ${ES_USERNAME}
+        password: ${ES_PASSWORD}
+      
+      # Export to OTLP endpoint (for custom processing)
+      otlp:
+        endpoint: ai-processor-service.observability.svc.cluster.local:4317
+        tls:
+          insecure: true
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      
+      pprof:
+        endpoint: 0.0.0.0:1777
+      
+      zpages:
+        endpoint: 0.0.0.0:55679
+
+    service:
+      extensions: [health_check, pprof, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, attributes, resourcedetection]
+          exporters: [jaeger, otlp, kafka]
+        
+        metrics:
+          receivers: [otlp, prometheus, jmx]
+          processors: [memory_limiter, batch, filter, attributes, resourcedetection]
+          exporters: [prometheus, kafka, otlp]
+        
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, attributes, resourcedetection]
+          exporters: [elasticsearch, kafka, otlp]

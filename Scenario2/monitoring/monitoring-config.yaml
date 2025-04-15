@@ -1,0 +1,47 @@
+monitoring:
+  # OpenTelemetry Configuration
+  opentelemetry:
+    collectors:
+      - name: "aws-collector"
+        region: "us-east-1"
+      - name: "azure-collector"
+        region: "eastus"
+    exporters:
+      - datadog
+      - azure_monitor
+
+  # Datadog Integration
+  datadog:
+    metrics:
+      - system_metrics
+      - application_metrics
+      - business_metrics
+    logs:
+      - audit_logs
+      - application_logs
+      - security_logs
+    apm:
+      enabled: true
+      distributed_tracing: true
+
+  # Azure Monitor
+  azure_monitor:
+    workspace_name: "fintech-logs"
+    retention_days: 90
+    features:
+      - activity_logs
+      - diagnostic_logs
+      - metrics
+
+  # Alerts
+  alerts:
+    security:
+      - name: "unauthorized_access"
+        severity: "critical"
+      - name: "compliance_violation"
+        severity: "high"
+    performance:
+      - name: "high_latency"
+        threshold: "1s"
+      - name: "error_rate"
+        threshold: "1%"

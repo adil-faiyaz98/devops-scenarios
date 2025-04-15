@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cost-alerts
+  namespace: kubecost
+spec:
+  groups:
+  - name: cost-monitoring
+    rules:
+    - alert: TenantCostSpike
+      expr: |
+        sum(kubecost_namespace_cost) by (namespace) > 
+        sum(kubecost_namespace_cost offset 7d) by (namespace) * 1.5
+      for: 24h
+      labels:
+        severity: warning
+        category: cost
+      annotations:
+        summary: "Tenant cost spike detected"
+        description: "Namespace {{ $labels.namespace }} costs increased by 50% compared to last week"
+        
+    - alert: ClusterCostIncrease
+      expr: |
+        sum(kubecost_cluster_total_cost) > 
+        sum(kubecost_cluster_total_cost offset 1d) * 1.2
+      for: 6h
+      labels:
+        severity: warning
+        category: cost
+      annotations:
+        summary: "Daily cluster cost increased by more than 20%"
+        description: "Cluster costs have increased by more than 20% in the last 6 hours"
+        
+    - alert: UnusedResourceCost
+      expr: |
+        sum(kubecost_idle_cost) by (namespace) > 100
+      for: 24h
+      labels:
+        severity: info
+        category: cost
+      annotations:
+        summary: "High idle resource cost detected"
+        description: "Namespace {{ $labels.namespace }} has more than $100 in idle resource costs"

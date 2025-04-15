@@ -1,0 +1,214 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-server-conf
+  namespace: observability
+  labels:
+    app: prometheus-server
+data:
+  prometheus.yml: |-
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: production
+        replica: $(POD_NAME)
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      # OpenTelemetry Collector metrics
+      - job_name: 'otel-collector'
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - observability
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: otel-collector
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: metrics
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: service
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+      # Kubernetes API server
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: default;kubernetes;https
+
+      # Kubernetes nodes
+      - job_name: 'kubernetes-nodes'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      # Kubernetes pods
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+
+      # Kafka metrics
+      - job_name: 'kafka'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - kafka
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_strimzi_io_name]
+            action: keep
+            regex: kafka-cluster-kafka
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: (\d+)
+            replacement: $1:9404
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+
+      # SageMaker metrics
+      - job_name: 'sagemaker'
+        metrics_path: /metrics
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        aws_sd_configs:
+          - region: us-east-1
+            role_arn: arn:aws:iam::123456789012:role/prometheus-sagemaker-discovery
+            port: 8080
+            filters:
+              - name: "tag:Environment"
+                values: ["production"]
+              - name: "tag:Service"
+                values: ["anomaly-detection"]
+
+      # OpenTelemetry metrics endpoint
+      - job_name: 'otel-metrics'
+        static_configs:
+          - targets: ['otel-collector.observability.svc.cluster.local:8889']
+
+    remote_write:
+      - url: "http://thanos-receive.observability.svc.cluster.local:19291/api/v1/receive"
+        queue_config:
+          capacity: 10000
+          max_samples_per_send: 2000
+          batch_send_deadline: 5s
+        write_relabel_configs:
+          - source_labels: [__name__]
+            regex: up|scrape_duration_seconds|scrape_samples_post_metric_relabeling|scrape_samples_scraped|scrape_series_added
+            action: drop
+
+  recording_rules.yml: |-
+    groups:
+      - name: e-commerce-metrics
+        rules:
+          - record: job:request_latency_seconds:mean5m
+            expr: sum(rate(request_latency_seconds_sum[5m])) by (job) / sum(rate(request_latency_seconds_count[5m])) by (job)
+          
+          - record: job:request_errors:rate5m
+            expr: sum(rate(request_errors_total[5m])) by (job)
+          
+          - record: job:request_rate:5m
+            expr: sum(rate(request_total[5m])) by (job)
+          
+          - record: job:orders_total:rate5m
+            expr: sum(rate(orders_total[5m])) by (job)
+          
+          - record: job:order_value_total:rate5m
+            expr: sum(rate(order_value_total[5m])) by (job)
+          
+          - record: job:cart_abandonment_rate:5m
+            expr: sum(rate(cart_abandoned_total[5m])) by (job) / sum(rate(cart_created_total[5m])) by (job)
+
+  alert_rules.yml: |-
+    groups:
+      - name: e-commerce-alerts
+        rules:
+          - alert: HighLatency
+            expr: job:request_latency_seconds:mean5m > 0.5
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High latency detected for {{ $labels.job }}"
+              description: "{{ $labels.job }} has a latency of {{ $value }} seconds, which is above the threshold of 0.5 seconds for 5 minutes."
+          
+          - alert: HighErrorRate
+            expr: job:request_errors:rate5m / job:request_rate:5m > 0.05
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High error rate detected for {{ $labels.job }}"
+              description: "{{ $labels.job }} has an error rate of {{ $value | humanizePercentage }}, which is above the threshold of 5% for 5 minutes."
+          
+          - alert: OrderRateDrop
+            expr: job:orders_total:rate5m < predict_linear(job:orders_total:rate5m[1h], 3600) * 0.8
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Order rate dropped for {{ $labels.job }}"
+              description: "{{ $labels.job }} has an order rate of {{ $value }}, which is 20% below the predicted value."
+          
+          - alert: CartAbandonmentRateHigh
+            expr: job:cart_abandonment_rate:5m > 0.7
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High cart abandonment rate for {{ $labels.job }}"
+              description: "{{ $labels.job }} has a cart abandonment rate of {{ $value | humanizePercentage }}, which is above the threshold of 70% for 15 minutes."

@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sagemaker-config
+  namespace: observability
+data:
+  sagemaker-endpoints.json: |
+    {
+      "endpoints": {
+        "latency-anomaly-detector": {
+          "endpoint_name": "ecommerce-latency-anomaly-detector",
+          "region": "us-east-1",
+          "input_schema": {
+            "service": "string",
+            "endpoint": "string",
+            "p50": "float",
+            "p90": "float",
+            "p99": "float",
+            "error_rate": "float",
+            "throughput": "float",
+            "cpu_usage": "float",
+            "memory_usage": "float"
+          },
+          "threshold": 0.8,
+          "description": "Detects anomalies in service latency metrics"
+        },
+        "error-anomaly-detector": {
+          "endpoint_name": "ecommerce-error-anomaly-detector",
+          "region": "us-east-1",
+          "input_schema": {
+            "service": "string",
+            "endpoint": "string",
+            "error_rate": "float",
+            "error_count": "float",
+            "status_4xx": "float",
+            "status_5xx": "float"
+          },
+          "threshold": 0.7,
+          "description": "Detects anomalies in error patterns"
+        },
+        "traffic-anomaly-detector": {
+          "endpoint_name": "ecommerce-traffic-anomaly-detector",
+          "region": "us-east-1",
+          "input_schema": {
+            "service": "string",
+            "endpoint": "string",
+            "requests_per_second": "float",
+            "unique_users": "float",
+            "session_count": "float",
+            "geographic_distribution": "object"
+          },
+          "threshold": 0.75,
+          "description": "Detects anomalies in traffic patterns"
+        },
+        "business-anomaly-detector": {
+          "endpoint_name": "ecommerce-business-anomaly-detector",
+          "region": "us-east-1",
+          "input_schema": {
+            "conversion_rate": "float",
+            "cart_abandonment_rate": "float",
+            "average_order_value": "float",
+            "checkout_success_rate": "float",
+            "payment_success_rate": "float"
+          },
+          "threshold": 0.8,
+          "description": "Detects anomalies in business metrics"
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sagemaker-predictor
+  namespace: observability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sagemaker-predictor
+  template:
+    metadata:
+      labels:
+        app: sagemaker-predictor
+    spec:
+      serviceAccountName: sagemaker-predictor-sa
+      containers:
+      - name: predictor
+        image: amazon/aws-sagemaker-predictor:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: PROMETHEUS_PUSH_GATEWAY
+          value: "prometheus-pushgateway.observability.svc.cluster.local:9091"
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          valueFrom:
+            configMapKeyRef:
+              name: kafka-config
+              key: brokers
+        - name: KAFKA_TOPIC_METRICS
+          value: "telemetry-metrics"
+        - name: KAFKA_TOPIC_PREDICTIONS
+          value: "ml-predictions"
+        - name: PREDICTION_INTERVAL_SECONDS
+          value: "60"
+        volumeMounts:
+        - name: sagemaker-config
+          mountPath: /etc/sagemaker
+        - name: aws-credentials
+          mountPath: /root/.aws
+        resources:
+          limits:
+            cpu: 1
+            memory: 2Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+      volumes:
+      - name: sagemaker-config
+        configMap:
+          name: sagemaker-config
+      - name: aws-credentials
+        secret:
+          secretName: aws-credentials
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sagemaker-predictor
+  namespace: observability
+spec:
+  selector:
+    app: sagemaker-predictor
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sagemaker-predictor-sa
+  namespace: observability
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/sagemaker-predictor-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sagemaker-predictor-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sagemaker-predictor-binding
+subjects:
+- kind: ServiceAccount
+  name: sagemaker-predictor-sa
+  namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: sagemaker-predictor-role
+  apiGroup: rbac.authorization.k8s.io

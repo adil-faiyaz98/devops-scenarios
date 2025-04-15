@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-shared-config
+  namespace: ingress-nginx
+data:
+  proxy-buffer-size: "256k"
+  proxy-body-size: "10m"
+  large-client-header-buffers: "4 32k"
+  client-header-buffer-size: "16k"
+  http2-max-field-size: "16k"
+  http2-max-header-size: "32k"
+  worker-connections: "8192"
+  keep-alive-requests: "1000"
+  upstream-keepalive-connections: "200"

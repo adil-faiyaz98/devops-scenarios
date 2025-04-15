@@ -1,0 +1,45 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: tenant-isolation-enhanced
+  namespace: ${TENANT_NAMESPACE}
+spec:
+  selector: all()
+  types:
+  - Ingress
+  - Egress
+  ingress:
+  - action: Allow
+    source:
+      namespaceSelector: name == "${TENANT_NAMESPACE}"
+  - action: Allow
+    source:
+      namespaceSelector: name in {"istio-system", "monitoring", "logging"}
+  egress:
+  - action: Allow
+    destination:
+      namespaceSelector: name == "${TENANT_NAMESPACE}"
+  - action: Allow
+    destination:
+      namespaceSelector: name in {"istio-system", "monitoring", "logging"}
+      ports:
+      - protocol: TCP
+        port: 15017 # Istio Pilot
+      - protocol: TCP
+        port: 15012 # Istio Citadel
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: tenant-auth-policy
+  namespace: ${TENANT_NAMESPACE}
+spec:
+  selector:
+    matchLabels:
+      app: ${TENANT_APP}
+  rules:
+  - from:
+    - source:
+        namespaces: ["${TENANT_NAMESPACE}"]
+    - source:
+        principals: ["cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"]

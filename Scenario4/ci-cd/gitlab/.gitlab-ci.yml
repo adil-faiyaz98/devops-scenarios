@@ -1,0 +1,438 @@
+stages:
+  - validate
+  - build
+  - deploy-infrastructure
+  - deploy-sagemaker
+  - deploy-grafana
+  - verify
+
+variables:
+  NAMESPACE_OBSERVABILITY: "observability"
+  NAMESPACE_KAFKA: "kafka"
+  AWS_REGION: "us-east-1"
+  DEPLOYMENT_ID: ${CI_PIPELINE_ID}
+  KUBECTL_VERSION: "1.27.3"
+  HELM_VERSION: "3.13.1"
+
+# Default to dev environment
+.set_environment: &set_environment
+  before_script:
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "main" ]]; then
+        export ENVIRONMENT="prod"
+      else
+        export ENVIRONMENT="dev"
+      fi
+      echo "Deploying to $ENVIRONMENT environment"
+
+# Reusable template for Kubernetes setup
+.k8s_setup: &k8s_setup
+  before_script:
+    - *set_environment
+    - apk add --no-cache curl
+    - curl -LO https://storage.googleapis.com/kubernetes-release/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl
+    - chmod +x ./kubectl && mv ./kubectl /usr/local/bin/kubectl
+    - mkdir -p ~/.kube
+    - echo "${KUBECONFIG}" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+
+# Reusable template for Helm setup
+.helm_setup: &helm_setup
+  before_script:
+    - *set_environment
+    - apk add --no-cache curl
+    - curl -LO https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz
+    - tar -zxvf helm-v${HELM_VERSION}-linux-amd64.tar.gz
+    - mv linux-amd64/helm /usr/local/bin/helm
+    - helm repo add strimzi https://strimzi.io/charts/
+    - helm repo add elastic https://helm.elastic.co
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    - helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+    - helm repo update
+
+# Reusable template for AWS setup
+.aws_setup: &aws_setup
+  before_script:
+    - *set_environment
+    - apk add --no-cache python3 py3-pip
+    - pip3 install awscli
+    - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+    - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+    - aws configure set region ${AWS_REGION}
+
+# Validate Kubernetes manifests
+validate-manifests:
+  stage: validate
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  script:
+    - find ai-observability -name "*.yaml" -type f -exec kubectl --dry-run=client -o yaml apply -f {} \;
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Validate Python scripts
+validate-python:
+  stage: validate
+  image: python:3.9
+  script:
+    - python -m py_compile ai-observability/sagemaker/dynamic-thresholds.py
+    - python -m py_compile ai-observability/sagemaker/anomaly-detection-model.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Security scan
+security-scan:
+  stage: validate
+  image: python:3.9
+  script:
+    - pip install bandit
+    - bandit -r ai-observability/sagemaker/ -f json -o security-results.json || true
+  artifacts:
+    paths:
+      - security-results.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Build Grafana dashboards
+build-dashboards:
+  stage: build
+  image: alpine:3.17
+  script:
+    - apk add --no-cache tar
+    - mkdir -p dashboard-packages
+    - cp -r ai-observability/grafana/dashboards/* dashboard-packages/
+    - tar -czvf dashboards.tar.gz -C dashboard-packages .
+  artifacts:
+    paths:
+      - dashboards.tar.gz
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Build SageMaker model
+build-sagemaker-model:
+  stage: build
+  image: python:3.9
+  script:
+    - pip install boto3 pandas numpy scikit-learn joblib
+    - mkdir -p sagemaker-model/code
+    - cp ai-observability/sagemaker/anomaly-detection-model.py sagemaker-model/code/
+    - cd sagemaker-model
+    - tar -czvf ../sagemaker-model.tar.gz .
+  artifacts:
+    paths:
+      - sagemaker-model.tar.gz
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Deploy Kafka
+deploy-kafka:
+  stage: deploy-infrastructure
+  image: alpine:3.17
+  <<: *helm_setup
+  <<: *k8s_setup
+  script:
+    - kubectl create namespace ${NAMESPACE_KAFKA} --dry-run=client -o yaml | kubectl apply -f -
+    - helm upgrade --install kafka-operator strimzi/strimzi-kafka-operator --namespace ${NAMESPACE_KAFKA} --wait --timeout 5m
+    - kubectl apply -f ai-observability/kafka/kafka-config.yaml
+    - kubectl wait --for=condition=Ready --timeout=10m kafka/kafka-cluster -n ${NAMESPACE_KAFKA} || true
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy Elasticsearch and Jaeger
+deploy-elasticsearch-jaeger:
+  stage: deploy-infrastructure
+  image: alpine:3.17
+  <<: *helm_setup
+  <<: *k8s_setup
+  script:
+    - kubectl create namespace ${NAMESPACE_OBSERVABILITY} --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl create secret generic elasticsearch-credentials \
+        --from-literal=username=elastic \
+        --from-literal=password=${ELASTICSEARCH_PASSWORD} \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - helm upgrade --install elasticsearch elastic/elasticsearch \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --set replicas=3 \
+        --set minimumMasterNodes=2 \
+        --set resources.requests.cpu=1 \
+        --set resources.requests.memory=2Gi \
+        --set resources.limits.cpu=2 \
+        --set resources.limits.memory=4Gi \
+        --wait --timeout 10m
+    - kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.35.0/jaeger-operator.yaml -n ${NAMESPACE_OBSERVABILITY}
+    - kubectl wait --for=condition=Available --timeout=5m deployment/jaeger-operator -n ${NAMESPACE_OBSERVABILITY} || true
+    - sed "s/\${ES_USERNAME}/elastic/g; s/\${ES_PASSWORD}/${ELASTICSEARCH_PASSWORD}/g" \
+        ai-observability/jaeger/jaeger-deployment.yaml | kubectl apply -f -
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy Prometheus and Thanos
+deploy-prometheus-thanos:
+  stage: deploy-infrastructure
+  image: alpine:3.17
+  <<: *helm_setup
+  <<: *k8s_setup
+  script:
+    - kubectl apply -f ai-observability/prometheus/prometheus-config.yaml
+    - helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --set prometheus.prometheusSpec.configMaps[0]=prometheus-server-conf \
+        --wait --timeout 5m
+    - kubectl create secret generic thanos-objstore \
+        --from-literal=aws_access_key_id=${THANOS_AWS_ACCESS_KEY_ID} \
+        --from-literal=aws_secret_access_key=${THANOS_AWS_SECRET_ACCESS_KEY} \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl apply -f ai-observability/prometheus/thanos-config.yaml
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy OpenTelemetry
+deploy-opentelemetry:
+  stage: deploy-infrastructure
+  image: alpine:3.17
+  <<: *helm_setup
+  <<: *k8s_setup
+  script:
+    - helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --wait --timeout 5m
+    - kubectl apply -f ai-observability/opentelemetry/collector-config.yaml
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy SageMaker model
+deploy-sagemaker-model:
+  stage: deploy-sagemaker
+  image: python:3.9
+  <<: *aws_setup
+  script:
+    - aws s3 cp sagemaker-model.tar.gz s3://${SAGEMAKER_MODEL_BUCKET}/models/anomaly-detection/${DEPLOYMENT_ID}/model.tar.gz
+    - aws sagemaker create-model \
+        --model-name ecommerce-latency-anomaly-detector-${DEPLOYMENT_ID} \
+        --execution-role-arn ${SAGEMAKER_ROLE_ARN} \
+        --primary-container '{
+          "Image": "'${AWS_ACCOUNT_ID}'.dkr.ecr.'${AWS_REGION}'.amazonaws.com/sagemaker-scikit-learn:1.0-1",
+          "ModelDataUrl": "s3://'${SAGEMAKER_MODEL_BUCKET}'/models/anomaly-detection/'${DEPLOYMENT_ID}'/model.tar.gz",
+          "Environment": {
+            "SAGEMAKER_PROGRAM": "anomaly-detection-model.py"
+          }
+        }'
+    - aws sagemaker create-endpoint-config \
+        --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID} \
+        --production-variants '[{
+          "VariantName": "AllTraffic",
+          "ModelName": "ecommerce-latency-anomaly-detector-'${DEPLOYMENT_ID}'",
+          "InitialInstanceCount": 1,
+          "InstanceType": "ml.m5.large"
+        }]'
+    - |
+      if aws sagemaker describe-endpoint --endpoint-name ecommerce-latency-anomaly-detector &>/dev/null; then
+        aws sagemaker update-endpoint \
+          --endpoint-name ecommerce-latency-anomaly-detector \
+          --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID}
+      else
+        aws sagemaker create-endpoint \
+          --endpoint-name ecommerce-latency-anomaly-detector \
+          --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID}
+      fi
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy SageMaker integration
+deploy-sagemaker-integration:
+  stage: deploy-sagemaker
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  <<: *k8s_setup
+  script:
+    - kubectl apply -f ai-observability/sagemaker/sagemaker-integration.yaml
+    - kubectl create configmap dynamic-thresholds-script \
+        --from-file=ai-observability/sagemaker/dynamic-thresholds.py \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      cat <<EOF | kubectl apply -f -
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: thresholds-config
+        namespace: ${NAMESPACE_OBSERVABILITY}
+      data:
+        thresholds-config.json: |
+          {
+            "region": "${AWS_REGION}",
+            "metrics": [
+              {
+                "name": "latency_p95",
+                "query": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+                "endpoint": "latency-anomaly-detector",
+                "window": "1h",
+                "alert_name": "HighLatencyAnomaly",
+                "comparison": ">",
+                "for": "5m",
+                "severity": "warning",
+                "dashboard": "https://grafana.example.com/d/service-overview"
+              },
+              {
+                "name": "error_rate",
+                "query": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))",
+                "endpoint": "error-anomaly-detector",
+                "window": "1h",
+                "alert_name": "HighErrorRateAnomaly",
+                "comparison": ">",
+                "for": "5m",
+                "severity": "warning",
+                "dashboard": "https://grafana.example.com/d/service-overview"
+              }
+            ],
+            "endpoints": [
+              {
+                "name": "latency-anomaly-detector",
+                "endpoint_name": "ecommerce-latency-anomaly-detector"
+              },
+              {
+                "name": "error-anomaly-detector",
+                "endpoint_name": "ecommerce-error-anomaly-detector"
+              }
+            ]
+          }
+      EOF
+    - |
+      cat <<EOF | kubectl apply -f -
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: dynamic-thresholds-generator
+        namespace: ${NAMESPACE_OBSERVABILITY}
+      spec:
+        schedule: "*/30 * * * *"
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                containers:
+                - name: dynamic-thresholds
+                  image: python:3.9
+                  command:
+                  - python
+                  - /app/dynamic-thresholds.py
+                  - --config=/app/config/thresholds-config.json
+                  - --prometheus-url=http://prometheus-server.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:9090
+                  - --rules-dir=/app/rules
+                  volumeMounts:
+                  - name: dynamic-thresholds-script
+                    mountPath: /app
+                  - name: thresholds-config
+                    mountPath: /app/config
+                  - name: rules-volume
+                    mountPath: /app/rules
+                volumes:
+                - name: dynamic-thresholds-script
+                  configMap:
+                    name: dynamic-thresholds-script
+                - name: thresholds-config
+                  configMap:
+                    name: thresholds-config
+                - name: rules-volume
+                  emptyDir: {}
+                restartPolicy: OnFailure
+      EOF
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Deploy Grafana
+deploy-grafana:
+  stage: deploy-grafana
+  image: alpine:3.17
+  <<: *k8s_setup
+  script:
+    - apk add --no-cache tar
+    - mkdir -p dashboards/{default,sre,dev,business}
+    - tar -xzvf dashboards.tar.gz -C dashboards
+    - kubectl create secret generic grafana-secrets \
+        --from-literal=admin-password=${GRAFANA_ADMIN_PASSWORD} \
+        --from-literal=oauth-client-id=${GRAFANA_OAUTH_CLIENT_ID} \
+        --from-literal=oauth-client-secret=${GRAFANA_OAUTH_CLIENT_SECRET} \
+        --from-literal=slack-sre-webhook-url=${SLACK_SRE_WEBHOOK_URL} \
+        --from-literal=slack-api-token=${SLACK_API_TOKEN} \
+        --from-literal=pagerduty-integration-key=${PAGERDUTY_INTEGRATION_KEY} \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl apply -f ai-observability/grafana/grafana-config.yaml
+    - kubectl apply -f ai-observability/grafana/rbac-config.yaml
+    - kubectl create configmap grafana-dashboards-default \
+        --from-file=dashboards/default/ \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl create configmap grafana-dashboards-sre \
+        --from-file=dashboards/sre/ \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl create configmap grafana-dashboards-dev \
+        --from-file=dashboards/dev/ \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl create configmap grafana-dashboards-business \
+        --from-file=dashboards/business/ \
+        --namespace ${NAMESPACE_OBSERVABILITY} \
+        --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: false
+
+# Verify deployment
+verify-deployment:
+  stage: verify
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  <<: *k8s_setup
+  script:
+    - echo "Checking Kafka..."
+    - kubectl get pods -n ${NAMESPACE_KAFKA}
+    - kubectl get kafkatopics -n ${NAMESPACE_KAFKA} || true
+    - echo "Checking Elasticsearch and Jaeger..."
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=elasticsearch
+    - kubectl get jaeger -n ${NAMESPACE_OBSERVABILITY} || true
+    - echo "Checking Prometheus and Thanos..."
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=prometheus || true
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=thanos-query || true
+    - echo "Checking OpenTelemetry Collector..."
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=otel-collector || true
+    - echo "Checking SageMaker Integration..."
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=sagemaker-predictor || true
+    - echo "Checking Grafana..."
+    - kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=grafana || true
+    - kubectl wait --for=condition=Available --timeout=5m deployment/grafana -n ${NAMESPACE_OBSERVABILITY} || true
+  environment:
+    name: $ENVIRONMENT
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'

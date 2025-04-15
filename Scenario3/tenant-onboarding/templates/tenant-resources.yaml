@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${TENANT_NAMESPACE}
+  labels:
+    istio-injection: enabled
+    tenant: ${TENANT_NAME}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${TENANT_NAME}-apps
+  namespace: argocd
+spec:
+  project: ${TENANT_NAME}
+  source:
+    repoURL: https://github.com/company/${TENANT_NAME}-apps.git
+    path: kubernetes
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${TENANT_NAMESPACE}

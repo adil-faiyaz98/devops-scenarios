@@ -1,0 +1,16 @@
+oidc:
+  providers:
+    - name: "corporate-identity"
+      type: "azure-ad"
+      issuer: "https://login.microsoftonline.com/${TENANT_ID}/v2.0"
+      clientID: ${CLIENT_ID}
+      groupsClaim: groups
+      groupsPrefix: "az:"
+      requiredClaims:
+        - key: "email_verified"
+          value: "true"
+      scopes:
+        - "openid"
+        - "profile"
+        - "email"
+        - "groups"

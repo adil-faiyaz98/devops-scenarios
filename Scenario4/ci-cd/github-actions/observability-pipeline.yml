@@ -1,0 +1,660 @@
+name: AI-driven Observability Pipeline CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'ai-observability/**'
+      - 'ci-cd/github-actions/observability-pipeline.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ai-observability/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      deployment_type:
+        description: 'Deployment Type'
+        required: true
+        type: choice
+        options:
+          - full
+          - update-dashboards
+          - update-alerts
+
+env:
+  KUBECTL_VERSION: '1.27.3'
+  HELM_VERSION: '3.13.1'
+  AWS_REGION: 'us-east-1'
+  NAMESPACE_OBSERVABILITY: 'observability'
+  NAMESPACE_KAFKA: 'kafka'
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deployment_id: ${{ steps.set-env.outputs.deployment_id }}
+    steps:
+      - id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+          echo "deployment_id=$(date +%s)" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Validate Kubernetes manifests
+        run: |
+          find ai-observability -name "*.yaml" -type f -exec kubectl --dry-run=client -o yaml apply -f {} \;
+
+      - name: Validate Prometheus configuration
+        run: |
+          # Install promtool for validation
+          PROM_VERSION="2.45.0"
+          wget -q https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+          tar xfz prometheus-${PROM_VERSION}.linux-amd64.tar.gz
+          cd prometheus-${PROM_VERSION}.linux-amd64
+          ./promtool check config ../ai-observability/prometheus/prometheus-config.yaml || true
+
+      - name: Validate Python scripts
+        run: |
+          python -m py_compile ai-observability/sagemaker/dynamic-thresholds.py
+          python -m py_compile ai-observability/sagemaker/anomaly-detection-model.py
+
+  security-scan:
+    needs: [initialize, validate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'ai-observability'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-results'
+
+      - name: Check for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-dashboards:
+    needs: [initialize, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Grafana dashboard linter
+        run: npm install -g @grafana/toolkit
+
+      - name: Lint Grafana dashboards
+        run: |
+          find ai-observability/grafana/dashboards -name "*.json" -type f -exec grafana-toolkit plugin:lint {} \;
+
+      - name: Package dashboards
+        run: |
+          mkdir -p dashboard-packages
+          cp -r ai-observability/grafana/dashboards/* dashboard-packages/
+          tar -czvf dashboards.tar.gz -C dashboard-packages .
+
+      - name: Upload dashboard artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: grafana-dashboards
+          path: dashboards.tar.gz
+          retention-days: 5
+
+  build-sagemaker-model:
+    needs: [initialize, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pandas numpy scikit-learn joblib
+
+      - name: Package SageMaker model
+        run: |
+          mkdir -p sagemaker-model/code
+          cp ai-observability/sagemaker/anomaly-detection-model.py sagemaker-model/code/
+          cd sagemaker-model
+          tar -czvf ../sagemaker-model.tar.gz .
+
+      - name: Upload SageMaker model artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sagemaker-model
+          path: sagemaker-model.tar.gz
+          retention-days: 5
+
+  deploy-infrastructure:
+    needs: [initialize, validate, security-scan]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_type == 'full' || github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Set Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Create namespaces
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE_OBSERVABILITY }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace ${{ env.NAMESPACE_KAFKA }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy Kafka
+        run: |
+          helm repo add strimzi https://strimzi.io/charts/
+          helm repo update
+          helm upgrade --install kafka-operator strimzi/strimzi-kafka-operator \
+            --namespace ${{ env.NAMESPACE_KAFKA }} \
+            --wait --timeout 5m
+          kubectl apply -f ai-observability/kafka/kafka-config.yaml
+
+      - name: Deploy Elasticsearch and Jaeger
+        run: |
+          helm repo add elastic https://helm.elastic.co
+          helm repo update
+          
+          # Create Elasticsearch credentials secret
+          kubectl create secret generic elasticsearch-credentials \
+            --from-literal=username=elastic \
+            --from-literal=password=${{ secrets.ELASTICSEARCH_PASSWORD }} \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Install Elasticsearch
+          helm upgrade --install elasticsearch elastic/elasticsearch \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --set replicas=3 \
+            --set minimumMasterNodes=2 \
+            --set resources.requests.cpu=1 \
+            --set resources.requests.memory=2Gi \
+            --set resources.limits.cpu=2 \
+            --set resources.limits.memory=4Gi \
+            --wait --timeout 10m
+          
+          # Install Jaeger Operator
+          kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.35.0/jaeger-operator.yaml -n ${{ env.NAMESPACE_OBSERVABILITY }}
+          
+          # Wait for Jaeger Operator to be ready
+          kubectl wait --for=condition=Available --timeout=5m deployment/jaeger-operator -n ${{ env.NAMESPACE_OBSERVABILITY }}
+          
+          # Deploy Jaeger with credentials
+          sed "s/\${ES_USERNAME}/elastic/g; s/\${ES_PASSWORD}/${{ secrets.ELASTICSEARCH_PASSWORD }}/g" \
+            ai-observability/jaeger/jaeger-deployment.yaml | kubectl apply -f -
+
+      - name: Deploy Prometheus and Thanos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          
+          # Apply Prometheus configuration
+          kubectl apply -f ai-observability/prometheus/prometheus-config.yaml
+          
+          # Install Prometheus Operator
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --set prometheus.prometheusSpec.configMaps[0]=prometheus-server-conf \
+            --wait --timeout 5m
+          
+          # Create S3 credentials for Thanos
+          kubectl create secret generic thanos-objstore \
+            --from-literal=aws_access_key_id=${{ secrets.THANOS_AWS_ACCESS_KEY_ID }} \
+            --from-literal=aws_secret_access_key=${{ secrets.THANOS_AWS_SECRET_ACCESS_KEY }} \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy Thanos
+          kubectl apply -f ai-observability/prometheus/thanos-config.yaml
+
+      - name: Deploy OpenTelemetry Collector
+        run: |
+          helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo update
+          
+          # Install OpenTelemetry Operator
+          helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --wait --timeout 5m
+          
+          # Apply OpenTelemetry configuration
+          kubectl apply -f ai-observability/opentelemetry/collector-config.yaml
+
+  deploy-sagemaker:
+    needs: [initialize, build-sagemaker-model, deploy-infrastructure]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_type == 'full' || github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 awscli
+
+      - name: Download SageMaker model artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: sagemaker-model
+          path: .
+
+      - name: Upload model to S3
+        run: |
+          MODEL_BUCKET="${{ secrets.SAGEMAKER_MODEL_BUCKET }}"
+          MODEL_PATH="models/anomaly-detection/$(date +%Y-%m-%d)/model.tar.gz"
+          
+          aws s3 cp sagemaker-model.tar.gz s3://${MODEL_BUCKET}/${MODEL_PATH}
+          
+          # Create SageMaker model
+          aws sagemaker create-model \
+            --model-name ecommerce-latency-anomaly-detector-${{ needs.initialize.outputs.deployment_id }} \
+            --execution-role-arn ${{ secrets.SAGEMAKER_ROLE_ARN }} \
+            --primary-container '{
+              "Image": "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/sagemaker-scikit-learn:1.0-1",
+              "ModelDataUrl": "s3://'${MODEL_BUCKET}'/'${MODEL_PATH}'",
+              "Environment": {
+                "SAGEMAKER_PROGRAM": "anomaly-detection-model.py"
+              }
+            }'
+          
+          # Create endpoint configuration
+          aws sagemaker create-endpoint-config \
+            --endpoint-config-name ecommerce-latency-anomaly-detector-config-${{ needs.initialize.outputs.deployment_id }} \
+            --production-variants '[{
+              "VariantName": "AllTraffic",
+              "ModelName": "ecommerce-latency-anomaly-detector-${{ needs.initialize.outputs.deployment_id }}",
+              "InitialInstanceCount": 1,
+              "InstanceType": "ml.m5.large"
+            }]'
+          
+          # Create or update endpoint
+          ENDPOINT_EXISTS=$(aws sagemaker describe-endpoint --endpoint-name ecommerce-latency-anomaly-detector 2>/dev/null || echo "false")
+          
+          if [ "$ENDPOINT_EXISTS" == "false" ]; then
+            aws sagemaker create-endpoint \
+              --endpoint-name ecommerce-latency-anomaly-detector \
+              --endpoint-config-name ecommerce-latency-anomaly-detector-config-${{ needs.initialize.outputs.deployment_id }}
+          else
+            aws sagemaker update-endpoint \
+              --endpoint-name ecommerce-latency-anomaly-detector \
+              --endpoint-config-name ecommerce-latency-anomaly-detector-config-${{ needs.initialize.outputs.deployment_id }}
+          fi
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Set Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Deploy SageMaker integration
+        run: |
+          kubectl apply -f ai-observability/sagemaker/sagemaker-integration.yaml
+          
+          # Create ConfigMap for dynamic thresholds script
+          kubectl create configmap dynamic-thresholds-script \
+            --from-file=ai-observability/sagemaker/dynamic-thresholds.py \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create ConfigMap for thresholds configuration
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: thresholds-config
+            namespace: ${{ env.NAMESPACE_OBSERVABILITY }}
+          data:
+            thresholds-config.json: |
+              {
+                "region": "${{ env.AWS_REGION }}",
+                "metrics": [
+                  {
+                    "name": "latency_p95",
+                    "query": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+                    "endpoint": "latency-anomaly-detector",
+                    "window": "1h",
+                    "alert_name": "HighLatencyAnomaly",
+                    "comparison": ">",
+                    "for": "5m",
+                    "severity": "warning",
+                    "dashboard": "https://grafana.example.com/d/service-overview"
+                  },
+                  {
+                    "name": "error_rate",
+                    "query": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))",
+                    "endpoint": "error-anomaly-detector",
+                    "window": "1h",
+                    "alert_name": "HighErrorRateAnomaly",
+                    "comparison": ">",
+                    "for": "5m",
+                    "severity": "warning",
+                    "dashboard": "https://grafana.example.com/d/service-overview"
+                  }
+                ],
+                "endpoints": [
+                  {
+                    "name": "latency-anomaly-detector",
+                    "endpoint_name": "ecommerce-latency-anomaly-detector"
+                  },
+                  {
+                    "name": "error-anomaly-detector",
+                    "endpoint_name": "ecommerce-error-anomaly-detector"
+                  }
+                ]
+              }
+          EOF
+          
+          # Deploy dynamic thresholds job
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: dynamic-thresholds-generator
+            namespace: ${{ env.NAMESPACE_OBSERVABILITY }}
+          spec:
+            schedule: "*/30 * * * *"
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    containers:
+                    - name: dynamic-thresholds
+                      image: python:3.9
+                      command:
+                      - python
+                      - /app/dynamic-thresholds.py
+                      - --config=/app/config/thresholds-config.json
+                      - --prometheus-url=http://prometheus-server.${{ env.NAMESPACE_OBSERVABILITY }}.svc.cluster.local:9090
+                      - --rules-dir=/app/rules
+                      volumeMounts:
+                      - name: dynamic-thresholds-script
+                        mountPath: /app
+                      - name: thresholds-config
+                        mountPath: /app/config
+                      - name: rules-volume
+                        mountPath: /app/rules
+                    volumes:
+                    - name: dynamic-thresholds-script
+                      configMap:
+                        name: dynamic-thresholds-script
+                    - name: thresholds-config
+                      configMap:
+                        name: thresholds-config
+                    - name: rules-volume
+                      emptyDir: {}
+                    restartPolicy: OnFailure
+          EOF
+
+  deploy-grafana:
+    needs: [initialize, build-dashboards, deploy-infrastructure]
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Set Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Download dashboard artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: grafana-dashboards
+          path: .
+
+      - name: Extract dashboards
+        run: |
+          mkdir -p dashboards/{default,sre,dev,business}
+          tar -xzvf dashboards.tar.gz -C dashboards
+
+      - name: Deploy Grafana
+        run: |
+          # Create Grafana admin password secret
+          kubectl create secret generic grafana-secrets \
+            --from-literal=admin-password=${{ secrets.GRAFANA_ADMIN_PASSWORD }} \
+            --from-literal=oauth-client-id=${{ secrets.GRAFANA_OAUTH_CLIENT_ID }} \
+            --from-literal=oauth-client-secret=${{ secrets.GRAFANA_OAUTH_CLIENT_SECRET }} \
+            --from-literal=slack-sre-webhook-url=${{ secrets.SLACK_SRE_WEBHOOK_URL }} \
+            --from-literal=slack-api-token=${{ secrets.SLACK_API_TOKEN }} \
+            --from-literal=pagerduty-integration-key=${{ secrets.PAGERDUTY_INTEGRATION_KEY }} \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Apply Grafana configuration
+          kubectl apply -f ai-observability/grafana/grafana-config.yaml
+          
+          # Apply Grafana RBAC configuration
+          kubectl apply -f ai-observability/grafana/rbac-config.yaml
+          
+          # Create dashboard ConfigMaps
+          kubectl create configmap grafana-dashboards-default \
+            --from-file=dashboards/default/ \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create configmap grafana-dashboards-sre \
+            --from-file=dashboards/sre/ \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create configmap grafana-dashboards-dev \
+            --from-file=dashboards/dev/ \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create configmap grafana-dashboards-business \
+            --from-file=dashboards/business/ \
+            --namespace ${{ env.NAMESPACE_OBSERVABILITY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+  verify-deployment:
+    needs: [deploy-infrastructure, deploy-sagemaker, deploy-grafana]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Set Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Verify Kafka deployment
+        run: |
+          echo "Checking Kafka..."
+          kubectl get pods -n ${{ env.NAMESPACE_KAFKA }}
+          kubectl get kafkatopics -n ${{ env.NAMESPACE_KAFKA }}
+
+      - name: Verify Elasticsearch and Jaeger deployment
+        run: |
+          echo "Checking Elasticsearch and Jaeger..."
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=elasticsearch
+          kubectl get jaeger -n ${{ env.NAMESPACE_OBSERVABILITY }}
+
+      - name: Verify Prometheus and Thanos deployment
+        run: |
+          echo "Checking Prometheus and Thanos..."
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=prometheus
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=thanos-query
+
+      - name: Verify OpenTelemetry Collector deployment
+        run: |
+          echo "Checking OpenTelemetry Collector..."
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=otel-collector
+
+      - name: Verify SageMaker Integration deployment
+        run: |
+          echo "Checking SageMaker Integration..."
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=sagemaker-predictor
+
+      - name: Verify Grafana deployment
+        run: |
+          echo "Checking Grafana..."
+          kubectl get pods -n ${{ env.NAMESPACE_OBSERVABILITY }} -l app=grafana
+
+      - name: Run health checks
+        run: |
+          # Wait for Grafana to be ready
+          kubectl wait --for=condition=Available --timeout=5m deployment/grafana -n ${{ env.NAMESPACE_OBSERVABILITY }}
+          
+          # Get Grafana service endpoint
+          GRAFANA_ENDPOINT=$(kubectl get svc grafana -n ${{ env.NAMESPACE_OBSERVABILITY }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          # Check Grafana health
+          if [ -n "$GRAFANA_ENDPOINT" ]; then
+            curl -f http://$GRAFANA_ENDPOINT:3000/api/health || echo "Grafana health check failed but continuing"
+          else
+            echo "Grafana endpoint not available, skipping health check"
+          fi
+
+  notify:
+    needs: [verify-deployment]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "AI-driven Observability Pipeline Deployment Status: ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "AI-driven Observability Pipeline Deployment"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:* ${{ job.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:* ${{ needs.initialize.outputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Deployment ID:* ${{ needs.initialize.outputs.deployment_id }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:* ${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

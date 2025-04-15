@@ -1,0 +1,507 @@
+# Comprehensive CI/CD Pipeline for Enterprise Multi-Project Deployment
+# This pipeline handles the entire lifecycle from code to production
+# It includes security scanning, testing, building, and deployment stages
+
+name: Enterprise CI/CD Pipeline
+
+# Trigger the workflow on push to main/develop branches, pull requests, or manual dispatch
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  # Allow manual triggering with environment selection
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      deploy_type:
+        description: 'Type of deployment'
+        required: true
+        default: 'regular'
+        type: choice
+        options:
+          - regular
+          - hotfix
+
+# Global environment variables
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: '18.x'
+  TERRAFORM_VERSION: '1.5.7'
+  KUBECTL_VERSION: '1.27.3'
+
+jobs:
+  # Code Quality and Security Analysis
+  code-quality:
+    name: Code Quality & Security Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for proper analysis
+        
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Lint code
+        run: npm run lint
+        
+      # Static code analysis with SonarCloud
+      - name: Run static code analysis
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.organization=${{ github.repository_owner }}-org
+      
+      # Dependency vulnerability scanning
+      - name: Check for vulnerable dependencies
+        uses: snyk/actions/node@master
+        with:
+          args: --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # Comprehensive Testing
+  test:
+    name: Comprehensive Testing
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      # Unit tests with coverage reporting
+      - name: Run unit tests
+        run: npm test -- --coverage
+        
+      # Integration tests with test database
+      - name: Set up test database
+        run: docker-compose -f docker-compose.test.yml up -d
+        
+      - name: Run integration tests
+        run: npm run test:integration
+        
+      - name: Tear down test database
+        run: docker-compose -f docker-compose.test.yml down
+        
+      # End-to-end tests
+      - name: Run E2E tests
+        run: npm run test:e2e
+        
+      # Upload test results for reporting
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            coverage/
+            test-results/
+          retention-days: 7
+
+  # Container Security Scanning
+  security-scan:
+    name: Container Security Scanning
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      # Build the container for scanning
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Build container for scanning
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # Scan container image for vulnerabilities
+      - name: Run container vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      # Upload scan results
+      - name: Upload vulnerability scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'container-vulnerabilities'
+
+  # Build and Push Container Images
+  build:
+    name: Build and Push Container Images
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      # Set up Docker Buildx for efficient builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      # Login to GitHub Container Registry
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        
+      # Extract metadata for Docker
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          
+      # Build and push the container image
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+  # Deploy to Development Environment
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'dev'
+    environment: development
+    steps:
+      # Checkout GitOps repository
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v3
+        with:
+          repository: adil-faiyaz98/devops-dojo-gitops
+          token: ${{ secrets.FLUX_REPO_TOKEN }}
+          path: gitops
+          
+      # Update image tag in Kubernetes manifests
+      - name: Update image tag in Kubernetes manifests
+        run: |
+          cd gitops/apps/development/${{ github.event.repository.name }}
+          # Update the image tag in the deployment manifest
+          sed -i "s|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" deployment.yaml
+          
+      # Commit and push changes to GitOps repository
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "Update ${{ github.event.repository.name }} image to ${{ github.sha }}"
+          git push
+      
+      # Verify deployment
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_DEV }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ github.event.repository.name }} -n development --timeout=300s
+          
+      - name: Run smoke tests
+        run: |
+          # Simple health check to verify deployment
+          ENDPOINT=$(kubectl get svc ${{ github.event.repository.name }} -n development -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl -f http://$ENDPOINT/health || exit 1
+
+  # Deploy to Staging Environment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    if: (github.ref == 'refs/heads/main' && needs.deploy-dev.result == 'success') || github.event.inputs.environment == 'staging'
+    environment: staging
+    steps:
+      # Checkout GitOps repository
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v3
+        with:
+          repository: adil-faiyaz98/devops-dojo-gitops
+          token: ${{ secrets.FLUX_REPO_TOKEN }}
+          path: gitops
+          
+      # Update image tag in Kubernetes manifests
+      - name: Update image tag in Kubernetes manifests
+        run: |
+          cd gitops/apps/staging/${{ github.event.repository.name }}
+          # Update the image tag in the deployment manifest
+          sed -i "s|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" deployment.yaml
+          
+      # Commit and push changes to GitOps repository
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "Update ${{ github.event.repository.name }} image to ${{ github.sha }} in staging"
+          git push
+      
+      # Verify deployment
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ github.event.repository.name }} -n staging --timeout=300s
+          
+      # Run more comprehensive tests in staging
+      - name: Run integration tests against staging
+        run: |
+          # Get service endpoint
+          ENDPOINT=$(kubectl get svc ${{ github.event.repository.name }} -n staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          # Run integration tests against the staging environment
+          npm run test:staging -- --endpoint=http://$ENDPOINT
+
+  # Deploy to Production Environment
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: (github.ref == 'refs/heads/main' && needs.deploy-staging.result == 'success' && github.event.inputs.environment == 'prod') || (github.event.inputs.deploy_type == 'hotfix' && github.event.inputs.environment == 'prod')
+    environment: production
+    # Require manual approval for production deployments
+    steps:
+      # Checkout GitOps repository
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v3
+        with:
+          repository: adil-faiyaz98/devops-dojo-gitops
+          token: ${{ secrets.FLUX_REPO_TOKEN }}
+          path: gitops
+          
+      # For production, we implement a blue-green deployment strategy
+      - name: Prepare blue-green deployment
+        run: |
+          cd gitops/apps/production/${{ github.event.repository.name }}
+          
+          # Determine current active deployment (blue or green)
+          CURRENT_COLOR=$(grep -o 'color: blue\|color: green' deployment.yaml | cut -d ' ' -f 2)
+          
+          if [ "$CURRENT_COLOR" == "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+          
+          # Update the inactive deployment with new image
+          sed -i "s|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" deployment-$NEW_COLOR.yaml
+          
+          # Update the service to point to the new deployment
+          sed -i "s|selector:\n  app: ${{ github.event.repository.name }}\n  color: $CURRENT_COLOR|selector:\n  app: ${{ github.event.repository.name }}\n  color: $NEW_COLOR|g" service.yaml
+          
+          echo "NEW_COLOR=$NEW_COLOR" >> $GITHUB_ENV
+          
+      # Commit and push changes to GitOps repository
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "Update ${{ github.event.repository.name }} to ${{ github.sha }} in production (${{ env.NEW_COLOR }} deployment)"
+          git push
+      
+      # Verify deployment
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ github.event.repository.name }}-${{ env.NEW_COLOR }} -n production --timeout=300s
+          
+      # Verify the new deployment is healthy before finalizing
+      - name: Verify new deployment health
+        run: |
+          # Get service endpoint
+          ENDPOINT=$(kubectl get svc ${{ github.event.repository.name }} -n production -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          # Run health checks
+          for i in {1..5}; do
+            curl -f http://$ENDPOINT/health || exit 1
+            sleep 5
+          done
+          
+          # Run canary tests
+          npm run test:canary -- --endpoint=http://$ENDPOINT
+      
+      # Notify team of successful deployment
+      - name: Send deployment notification
+        if: success()
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          payload: |
+            {
+              "text": "✅ Successfully deployed ${{ github.event.repository.name }} to production.\nVersion: ${{ github.sha }}\nDeployment: ${{ env.NEW_COLOR }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Post-Deployment Verification and Monitoring
+  post-deploy:
+    name: Post-Deployment Verification
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging, deploy-prod]
+    if: always() && (needs.deploy-dev.result == 'success' || needs.deploy-staging.result == 'success' || needs.deploy-prod.result == 'success')
+    steps:
+      - name: Determine deployed environment
+        id: env
+        run: |
+          if [ "${{ needs.deploy-prod.result }}" == "success" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "namespace=production" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy-staging.result }}" == "success" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "namespace=staging" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+            echo "namespace=development" >> $GITHUB_OUTPUT
+          fi
+          
+      # Set up monitoring for the new deployment
+      - name: Set up monitoring alerts
+        run: |
+          echo "Setting up monitoring for ${{ github.event.repository.name }} in ${{ steps.env.outputs.environment }}"
+          
+          # This would typically involve API calls to your monitoring system
+          # For example, updating Prometheus alert rules or creating dashboards
+          
+          # Example: Create a Grafana dashboard via API
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "dashboard": {
+                "title": "${{ github.event.repository.name }} - ${{ steps.env.outputs.environment }}",
+                "tags": ["${{ github.event.repository.name }}", "${{ steps.env.outputs.environment }}", "auto-generated"],
+                "timezone": "browser",
+                "panels": [
+                  {
+                    "title": "Request Rate",
+                    "type": "graph",
+                    "datasource": "Prometheus",
+                    "targets": [
+                      {
+                        "expr": "sum(rate(http_requests_total{service=\"${{ github.event.repository.name }}\", namespace=\"${{ steps.env.outputs.namespace }}\"}[5m])) by (status_code)",
+                        "legendFormat": "{{status_code}}"
+                      }
+                    ]
+                  },
+                  {
+                    "title": "Response Time",
+                    "type": "graph",
+                    "datasource": "Prometheus",
+                    "targets": [
+                      {
+                        "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=\"${{ github.event.repository.name }}\", namespace=\"${{ steps.env.outputs.namespace }}\"}[5m])) by (le))",
+                        "legendFormat": "95th percentile"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "overwrite": true
+            }' \
+            https://grafana.example.com/api/dashboards/db
+            
+      # Update documentation
+      - name: Update deployment documentation
+        run: |
+          echo "Updating deployment documentation for ${{ github.event.repository.name }} in ${{ steps.env.outputs.environment }}"
+          
+          # This would typically involve updating a wiki or documentation system
+          # For example, updating a Confluence page or GitHub wiki
+          
+          # Example: Update a GitHub wiki page
+          git clone https://github.com/${{ github.repository }}.wiki.git wiki
+          cd wiki
+          
+          # Update deployment history
+          echo "| $(date -u +'%Y-%m-%d %H:%M:%S') | ${{ github.sha }} | ${{ steps.env.outputs.environment }} | ${{ github.actor }} |" >> Deployment-History.md
+          
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "Update deployment documentation for ${{ github.event.repository.name }} in ${{ steps.env.outputs.environment }}"
+          git push

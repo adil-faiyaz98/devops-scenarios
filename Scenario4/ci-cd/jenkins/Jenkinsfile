@@ -1,0 +1,502 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: observability-pipeline
+spec:
+  containers:
+  - name: kubectl
+    image: bitnami/kubectl:1.27.3
+    command:
+    - cat
+    tty: true
+  - name: helm
+    image: alpine/helm:3.13.1
+    command:
+    - cat
+    tty: true
+  - name: aws
+    image: amazon/aws-cli:2.13.10
+    command:
+    - cat
+    tty: true
+  - name: python
+    image: python:3.9
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment for deployment')
+        choice(name: 'DEPLOYMENT_TYPE', choices: ['full', 'update-dashboards', 'update-alerts'], description: 'Type of deployment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+    }
+
+    environment {
+        NAMESPACE_OBSERVABILITY = 'observability'
+        NAMESPACE_KAFKA = 'kafka'
+        AWS_REGION = 'us-east-1'
+        DEPLOYMENT_ID = sh(script: 'date +%s', returnStdout: true).trim()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                container('kubectl') {
+                    sh '''
+                        find ai-observability -name "*.yaml" -type f -exec kubectl --dry-run=client -o yaml apply -f {} \\;
+                    '''
+                }
+                
+                container('python') {
+                    sh '''
+                        python -m py_compile ai-observability/sagemaker/dynamic-thresholds.py
+                        python -m py_compile ai-observability/sagemaker/anomaly-detection-model.py
+                    '''
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                container('python') {
+                    sh '''
+                        pip install bandit
+                        bandit -r ai-observability/sagemaker/ -f json -o security-results.json || true
+                    '''
+                }
+                
+                // Archive security scan results
+                archiveArtifacts artifacts: 'security-results.json', allowEmptyArchive: true
+            }
+        }
+
+        stage('Build Dashboards') {
+            steps {
+                container('python') {
+                    sh '''
+                        mkdir -p dashboard-packages
+                        cp -r ai-observability/grafana/dashboards/* dashboard-packages/
+                        tar -czvf dashboards.tar.gz -C dashboard-packages .
+                    '''
+                }
+                
+                // Archive dashboard artifacts
+                archiveArtifacts artifacts: 'dashboards.tar.gz', allowEmptyArchive: false
+            }
+        }
+
+        stage('Build SageMaker Model') {
+            steps {
+                container('python') {
+                    sh '''
+                        pip install boto3 pandas numpy scikit-learn joblib
+                        mkdir -p sagemaker-model/code
+                        cp ai-observability/sagemaker/anomaly-detection-model.py sagemaker-model/code/
+                        cd sagemaker-model
+                        tar -czvf ../sagemaker-model.tar.gz .
+                    '''
+                }
+                
+                // Archive SageMaker model artifact
+                archiveArtifacts artifacts: 'sagemaker-model.tar.gz', allowEmptyArchive: false
+            }
+        }
+
+        stage('Deploy Infrastructure') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' }
+            }
+            steps {
+                container('kubectl') {
+                    sh '''
+                        kubectl create namespace ${NAMESPACE_OBSERVABILITY} --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl create namespace ${NAMESPACE_KAFKA} --dry-run=client -o yaml | kubectl apply -f -
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Deploy Kafka
+                        helm repo add strimzi https://strimzi.io/charts/
+                        helm repo update
+                        helm upgrade --install kafka-operator strimzi/strimzi-kafka-operator \\
+                            --namespace ${NAMESPACE_KAFKA} \\
+                            --wait --timeout 5m
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Deploy Kafka cluster and topics
+                        kubectl apply -f ai-observability/kafka/kafka-config.yaml
+                        
+                        # Wait for Kafka to be ready (may timeout in CI, so we allow it to fail)
+                        kubectl wait --for=condition=Ready --timeout=5m kafka/kafka-cluster -n ${NAMESPACE_KAFKA} || true
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Deploy Elasticsearch
+                        helm repo add elastic https://helm.elastic.co
+                        helm repo update
+                        
+                        # Install Elasticsearch
+                        helm upgrade --install elasticsearch elastic/elasticsearch \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --set replicas=3 \\
+                            --set minimumMasterNodes=2 \\
+                            --set resources.requests.cpu=1 \\
+                            --set resources.requests.memory=2Gi \\
+                            --set resources.limits.cpu=2 \\
+                            --set resources.limits.memory=4Gi \\
+                            --wait --timeout 10m
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Create Elasticsearch credentials secret
+                        kubectl create secret generic elasticsearch-credentials \\
+                            --from-literal=username=elastic \\
+                            --from-literal=password=${ELASTICSEARCH_PASSWORD} \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Install Jaeger Operator
+                        kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.35.0/jaeger-operator.yaml -n ${NAMESPACE_OBSERVABILITY}
+                        
+                        # Wait for Jaeger Operator to be ready
+                        kubectl wait --for=condition=Available --timeout=5m deployment/jaeger-operator -n ${NAMESPACE_OBSERVABILITY} || true
+                        
+                        # Deploy Jaeger with credentials
+                        sed "s/\\${ES_USERNAME}/elastic/g; s/\\${ES_PASSWORD}/${ELASTICSEARCH_PASSWORD}/g" \\
+                            ai-observability/jaeger/jaeger-deployment.yaml | kubectl apply -f -
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Deploy Prometheus
+                        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                        helm repo update
+                        
+                        # Install Prometheus Operator
+                        helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --set prometheus.prometheusSpec.configMaps[0]=prometheus-server-conf \\
+                            --wait --timeout 5m
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Apply Prometheus configuration
+                        kubectl apply -f ai-observability/prometheus/prometheus-config.yaml
+                        
+                        # Create S3 credentials for Thanos
+                        kubectl create secret generic thanos-objstore \\
+                            --from-literal=aws_access_key_id=${THANOS_AWS_ACCESS_KEY_ID} \\
+                            --from-literal=aws_secret_access_key=${THANOS_AWS_SECRET_ACCESS_KEY} \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Deploy Thanos
+                        kubectl apply -f ai-observability/prometheus/thanos-config.yaml
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Deploy OpenTelemetry
+                        helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+                        helm repo update
+                        
+                        # Install OpenTelemetry Operator
+                        helm upgrade --install opentelemetry-operator open-telemetry/opentelemetry-operator \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --wait --timeout 5m
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Apply OpenTelemetry configuration
+                        kubectl apply -f ai-observability/opentelemetry/collector-config.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy SageMaker') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'update-alerts' }
+            }
+            steps {
+                container('aws') {
+                    sh '''
+                        # Upload model to S3
+                        aws s3 cp sagemaker-model.tar.gz s3://${SAGEMAKER_MODEL_BUCKET}/models/anomaly-detection/${DEPLOYMENT_ID}/model.tar.gz
+                        
+                        # Create SageMaker model
+                        aws sagemaker create-model \\
+                            --model-name ecommerce-latency-anomaly-detector-${DEPLOYMENT_ID} \\
+                            --execution-role-arn ${SAGEMAKER_ROLE_ARN} \\
+                            --primary-container '{
+                                "Image": "'${AWS_ACCOUNT_ID}'.dkr.ecr.'${AWS_REGION}'.amazonaws.com/sagemaker-scikit-learn:1.0-1",
+                                "ModelDataUrl": "s3://'${SAGEMAKER_MODEL_BUCKET}'/models/anomaly-detection/'${DEPLOYMENT_ID}'/model.tar.gz",
+                                "Environment": {
+                                    "SAGEMAKER_PROGRAM": "anomaly-detection-model.py"
+                                }
+                            }'
+                        
+                        # Create endpoint configuration
+                        aws sagemaker create-endpoint-config \\
+                            --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID} \\
+                            --production-variants '[{
+                                "VariantName": "AllTraffic",
+                                "ModelName": "ecommerce-latency-anomaly-detector-'${DEPLOYMENT_ID}'",
+                                "InitialInstanceCount": 1,
+                                "InstanceType": "ml.m5.large"
+                            }]'
+                        
+                        # Check if endpoint exists
+                        if aws sagemaker describe-endpoint --endpoint-name ecommerce-latency-anomaly-detector &>/dev/null; then
+                            # Update existing endpoint
+                            aws sagemaker update-endpoint \\
+                                --endpoint-name ecommerce-latency-anomaly-detector \\
+                                --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID}
+                        else
+                            # Create new endpoint
+                            aws sagemaker create-endpoint \\
+                                --endpoint-name ecommerce-latency-anomaly-detector \\
+                                --endpoint-config-name ecommerce-latency-anomaly-detector-config-${DEPLOYMENT_ID}
+                        fi
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Deploy SageMaker integration
+                        kubectl apply -f ai-observability/sagemaker/sagemaker-integration.yaml
+                        
+                        # Create ConfigMap for dynamic thresholds script
+                        kubectl create configmap dynamic-thresholds-script \\
+                            --from-file=ai-observability/sagemaker/dynamic-thresholds.py \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Create ConfigMap for thresholds configuration
+                        cat <<EOF | kubectl apply -f -
+                        apiVersion: v1
+                        kind: ConfigMap
+                        metadata:
+                          name: thresholds-config
+                          namespace: ${NAMESPACE_OBSERVABILITY}
+                        data:
+                          thresholds-config.json: |
+                            {
+                              "region": "${AWS_REGION}",
+                              "metrics": [
+                                {
+                                  "name": "latency_p95",
+                                  "query": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+                                  "endpoint": "latency-anomaly-detector",
+                                  "window": "1h",
+                                  "alert_name": "HighLatencyAnomaly",
+                                  "comparison": ">",
+                                  "for": "5m",
+                                  "severity": "warning",
+                                  "dashboard": "https://grafana.example.com/d/service-overview"
+                                },
+                                {
+                                  "name": "error_rate",
+                                  "query": "sum(rate(http_requests_total{status=~\\"5..\\"}[5m])) / sum(rate(http_requests_total[5m]))",
+                                  "endpoint": "error-anomaly-detector",
+                                  "window": "1h",
+                                  "alert_name": "HighErrorRateAnomaly",
+                                  "comparison": ">",
+                                  "for": "5m",
+                                  "severity": "warning",
+                                  "dashboard": "https://grafana.example.com/d/service-overview"
+                                }
+                              ],
+                              "endpoints": [
+                                {
+                                  "name": "latency-anomaly-detector",
+                                  "endpoint_name": "ecommerce-latency-anomaly-detector"
+                                },
+                                {
+                                  "name": "error-anomaly-detector",
+                                  "endpoint_name": "ecommerce-error-anomaly-detector"
+                                }
+                              ]
+                            }
+                        EOF
+                        
+                        # Deploy dynamic thresholds job
+                        cat <<EOF | kubectl apply -f -
+                        apiVersion: batch/v1
+                        kind: CronJob
+                        metadata:
+                          name: dynamic-thresholds-generator
+                          namespace: ${NAMESPACE_OBSERVABILITY}
+                        spec:
+                          schedule: "*/30 * * * *"
+                          jobTemplate:
+                            spec:
+                              template:
+                                spec:
+                                  containers:
+                                  - name: dynamic-thresholds
+                                    image: python:3.9
+                                    command:
+                                    - python
+                                    - /app/dynamic-thresholds.py
+                                    - --config=/app/config/thresholds-config.json
+                                    - --prometheus-url=http://prometheus-server.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:9090
+                                    - --rules-dir=/app/rules
+                                    volumeMounts:
+                                    - name: dynamic-thresholds-script
+                                      mountPath: /app
+                                    - name: thresholds-config
+                                      mountPath: /app/config
+                                    - name: rules-volume
+                                      mountPath: /app/rules
+                                  volumes:
+                                  - name: dynamic-thresholds-script
+                                    configMap:
+                                      name: dynamic-thresholds-script
+                                  - name: thresholds-config
+                                    configMap:
+                                      name: thresholds-config
+                                  - name: rules-volume
+                                    emptyDir: {}
+                                  restartPolicy: OnFailure
+                        EOF
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Grafana') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'update-dashboards' }
+            }
+            steps {
+                container('python') {
+                    sh '''
+                        mkdir -p dashboards/{default,sre,dev,business}
+                        tar -xzvf dashboards.tar.gz -C dashboards
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Create Grafana admin password secret
+                        kubectl create secret generic grafana-secrets \\
+                            --from-literal=admin-password=${GRAFANA_ADMIN_PASSWORD} \\
+                            --from-literal=oauth-client-id=${GRAFANA_OAUTH_CLIENT_ID} \\
+                            --from-literal=oauth-client-secret=${GRAFANA_OAUTH_CLIENT_SECRET} \\
+                            --from-literal=slack-sre-webhook-url=${SLACK_SRE_WEBHOOK_URL} \\
+                            --from-literal=slack-api-token=${SLACK_API_TOKEN} \\
+                            --from-literal=pagerduty-integration-key=${PAGERDUTY_INTEGRATION_KEY} \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Apply Grafana configuration
+                        kubectl apply -f ai-observability/grafana/grafana-config.yaml
+                        
+                        # Apply Grafana RBAC configuration
+                        kubectl apply -f ai-observability/grafana/rbac-config.yaml
+                        
+                        # Create dashboard ConfigMaps
+                        kubectl create configmap grafana-dashboards-default \\
+                            --from-file=dashboards/default/ \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        kubectl create configmap grafana-dashboards-sre \\
+                            --from-file=dashboards/sre/ \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        kubectl create configmap grafana-dashboards-dev \\
+                            --from-file=dashboards/dev/ \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        kubectl create configmap grafana-dashboards-business \\
+                            --from-file=dashboards/business/ \\
+                            --namespace ${NAMESPACE_OBSERVABILITY} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                container('kubectl') {
+                    sh '''
+                        echo "Checking Kafka..."
+                        kubectl get pods -n ${NAMESPACE_KAFKA}
+                        kubectl get kafkatopics -n ${NAMESPACE_KAFKA} || true
+                        
+                        echo "Checking Elasticsearch and Jaeger..."
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=elasticsearch
+                        kubectl get jaeger -n ${NAMESPACE_OBSERVABILITY} || true
+                        
+                        echo "Checking Prometheus and Thanos..."
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=prometheus || true
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=thanos-query || true
+                        
+                        echo "Checking OpenTelemetry Collector..."
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=otel-collector || true
+                        
+                        echo "Checking SageMaker Integration..."
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=sagemaker-predictor || true
+                        
+                        echo "Checking Grafana..."
+                        kubectl get pods -n ${NAMESPACE_OBSERVABILITY} -l app=grafana || true
+                        
+                        # Wait for Grafana to be ready
+                        kubectl wait --for=condition=Available --timeout=5m deployment/grafana -n ${NAMESPACE_OBSERVABILITY} || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Deployment completed with status: ${currentBuild.result}"
+        }
+        success {
+            echo "Deployment successful!"
+        }
+        failure {
+            echo "Deployment failed!"
+        }
+    }
+}

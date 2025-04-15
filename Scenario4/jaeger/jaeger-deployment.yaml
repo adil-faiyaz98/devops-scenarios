@@ -1,0 +1,144 @@
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger
+  namespace: observability
+spec:
+  strategy: production
+  storage:
+    type: elasticsearch
+    options:
+      es:
+        server-urls: https://elasticsearch-master.observability.svc.cluster.local:9200
+        username: ${ES_USERNAME}
+        password: ${ES_PASSWORD}
+        tls:
+          ca: /es/certificates/ca.crt
+        index-prefix: jaeger
+        use-aliases: true
+    secretName: jaeger-es-secret
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - jaeger.example.com
+    tls:
+      - secretName: jaeger-tls
+        hosts:
+          - jaeger.example.com
+  query:
+    replicas: 2
+    serviceType: ClusterIP
+    options:
+      query:
+        base-path: /
+        additional-headers: ["Access-Control-Allow-Origin: *"]
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 250m
+        memory: 128Mi
+  collector:
+    replicas: 3
+    maxReplicas: 5
+    autoscale: true
+    options:
+      collector:
+        num-workers: 50
+        queue-size: 2000
+        http-server.host-port: ":14268"
+        grpc-server.host-port: ":14250"
+    resources:
+      limits:
+        cpu: 1
+        memory: 1Gi
+      requests:
+        cpu: 500m
+        memory: 512Mi
+  agent:
+    strategy: DaemonSet
+    options:
+      agent:
+        reporter.grpc.host-port: "jaeger-collector.observability.svc.cluster.local:14250"
+        processor.jaeger-binary.server-host-port: ":6832"
+        processor.jaeger-compact.server-host-port: ":6831"
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  volumeMounts:
+    - name: es-certs
+      mountPath: /es/certificates/
+      readOnly: true
+  volumes:
+    - name: es-certs
+      secret:
+        secretName: elasticsearch-certificates
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jaeger-es-secret
+  namespace: observability
+type: Opaque
+data:
+  ES_USERNAME: ZWxhc3RpYw==  # base64 encoded "elastic"
+  ES_PASSWORD: Y2hhbmdlbWU=  # base64 encoded "changeme"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-sampling
+  namespace: observability
+data:
+  sampling.json: |-
+    {
+      "service_strategies": [
+        {
+          "service": "checkout-service",
+          "type": "probabilistic",
+          "param": 1.0
+        },
+        {
+          "service": "payment-service",
+          "type": "probabilistic",
+          "param": 1.0
+        },
+        {
+          "service": "inventory-service",
+          "type": "probabilistic",
+          "param": 0.8
+        },
+        {
+          "service": "product-service",
+          "type": "probabilistic",
+          "param": 0.5
+        },
+        {
+          "service": "user-service",
+          "type": "probabilistic",
+          "param": 0.5
+        },
+        {
+          "service": "cart-service",
+          "type": "probabilistic",
+          "param": 0.8
+        },
+        {
+          "service": "search-service",
+          "type": "probabilistic",
+          "param": 0.3
+        }
+      ],
+      "default_strategy": {
+        "type": "probabilistic",
+        "param": 0.1
+      }
+    }
