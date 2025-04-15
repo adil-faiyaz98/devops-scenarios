@@ -1,5 +1,19 @@
 # AI-driven Observability Pipeline for E-commerce
 
+## Requirement
+
+Build an AI/ML-powered observability system using OpenTelemetry, Prometheus, Grafana, and integrate with anomaly detection models deployed via SageMaker.
+
+## Challenges
+
+- OpenTelemetry sidecars with custom spans for 500+ microservices
+- Real-time streaming of metrics to Kafka + long-term retention in Thanos
+- Integration of SageMaker endpoints for predictive alerting (dynamic thresholds)
+- Custom Grafana dashboards for SRE/Dev teams with RBAC
+- Correlation of logs/metrics/traces across services using distributed tracing (Jaeger)
+
+## Overview
+
 This solution implements an advanced observability system powered by AI/ML for a large-scale e-commerce platform with 500+ microservices.
 
 ## Architecture Overview
@@ -9,17 +23,20 @@ This solution implements an advanced observability system powered by AI/ML for a
 ### Key Components
 
 1. **Data Collection**
+
    - OpenTelemetry collectors and agents for 500+ microservices
    - Custom instrumentation for business-specific metrics
    - Distributed tracing with context propagation
 
 2. **Data Processing**
+
    - Kafka for real-time metrics streaming
    - Prometheus for metrics storage and querying
    - Thanos for long-term metrics retention
    - Jaeger for distributed trace analysis
 
 3. **AI/ML Integration**
+
    - SageMaker endpoints for anomaly detection
    - Dynamic thresholds for alerting
    - Predictive performance analysis

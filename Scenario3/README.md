@@ -1,5 +1,17 @@
 # Enterprise Kubernetes Platform as a Product
 
+## Requirement
+
+Deliver a centralized Kubernetes platform (EKS/GKE + Rancher/Anthos) for 20+ application teams with self-service GitOps, cost monitoring, RBAC, and secrets management.
+
+## Challenges
+
+- Multi-tenant cluster security and network isolation (Calico, Istio)
+- ArgoCD multi-app/multi-project GitOps with dynamic templating (Kustomize/Helm)
+- RBAC federation via SSO/OIDC for Dev, QA, and Prod environments
+- Ingress strategy for 200+ services with domain routing (NGINX/Envoy)
+- Shared services mesh (Istio) with mTLS and traffic shifting
+
 ## Overview
 
 Centralized Kubernetes platform solution for 20+ application teams in a Fortune 500 company, providing:
