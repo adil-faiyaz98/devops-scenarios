@@ -1,0 +1,537 @@
+name: SageMaker Model CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'ai-observability/sagemaker/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ai-observability/sagemaker/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: 'us-east-1'
+  PYTHON_VERSION: '3.9'
+  MODEL_VERSION: '1.0.0'
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      model_version: ${{ steps.set-version.outputs.model_version }}
+      deployment_id: ${{ steps.set-env.outputs.deployment_id }}
+    steps:
+      - id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+          echo "deployment_id=$(date +%s)" >> $GITHUB_OUTPUT
+      
+      - id: set-version
+        run: |
+          # Increment model version based on git history
+          echo "model_version=${{ env.MODEL_VERSION }}.$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pylint black isort mypy boto3 pandas numpy scikit-learn joblib
+
+      - name: Lint Python code
+        run: |
+          black --check ai-observability/sagemaker/
+          isort --check ai-observability/sagemaker/
+          pylint ai-observability/sagemaker/ --disable=C0111,C0103,C0303,C0330,C0326
+          mypy ai-observability/sagemaker/
+
+      - name: Run unit tests
+        run: |
+          pytest ai-observability/sagemaker/tests/ --cov=ai-observability/sagemaker/ --cov-report=xml
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: true
+
+  security-scan:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install security scanning tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit safety
+
+      - name: Run Bandit security scan
+        run: |
+          bandit -r ai-observability/sagemaker/ -f json -o bandit-results.json
+          cat bandit-results.json
+
+      - name: Check for vulnerable dependencies
+        run: |
+          safety check -r ai-observability/sagemaker/requirements.txt --json > safety-results.json
+          cat safety-results.json
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: |
+            bandit-results.json
+            safety-results.json
+          retention-days: 7
+
+  build-model:
+    needs: [initialize, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pandas numpy scikit-learn joblib
+
+      - name: Create model metadata
+        run: |
+          cat > ai-observability/sagemaker/model-metadata.json << EOF
+          {
+            "model_name": "anomaly-detection-model",
+            "model_version": "${{ needs.initialize.outputs.model_version }}",
+            "model_type": "anomaly-detection",
+            "framework": "scikit-learn",
+            "framework_version": "1.0-1",
+            "python_version": "${{ env.PYTHON_VERSION }}",
+            "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "created_by": "github-actions",
+            "git_commit": "${{ github.sha }}",
+            "environment": "${{ needs.initialize.outputs.environment }}",
+            "description": "Anomaly detection model for e-commerce metrics",
+            "metrics": ["latency", "error_rate", "throughput"],
+            "hyperparameters": {
+              "contamination": 0.05,
+              "n_estimators": 100,
+              "max_samples": "auto"
+            }
+          }
+          EOF
+
+      - name: Create model inference handler
+        run: |
+          cat > ai-observability/sagemaker/inference.py << EOF
+          import os
+          import json
+          import pickle
+          import numpy as np
+          import pandas as pd
+          from io import StringIO
+          import joblib
+
+          # Model loading function
+          def model_fn(model_dir):
+              """Load model from the model_dir."""
+              model_path = os.path.join(model_dir, "model.joblib")
+              model = joblib.load(model_path)
+              return model
+
+          # Input processing function
+          def input_fn(request_body, request_content_type):
+              """Parse input data payload."""
+              if request_content_type == 'application/json':
+                  data = json.loads(request_body)
+                  # Convert to numpy array for prediction
+                  if isinstance(data, list):
+                      return np.array(data).reshape(-1, 1)
+                  else:
+                      return np.array([data]).reshape(-1, 1)
+              elif request_content_type == 'text/csv':
+                  # Read CSV
+                  df = pd.read_csv(StringIO(request_body), header=None)
+                  return df.values
+              else:
+                  raise ValueError(f"Unsupported content type: {request_content_type}")
+
+          # Output processing function
+          def output_fn(prediction, accept):
+              """Format prediction output."""
+              if accept == 'application/json':
+                  # Convert prediction to anomaly scores and labels
+                  scores = prediction[0]
+                  threshold = prediction[1] if len(prediction) > 1 else -0.5
+                  labels = (scores < threshold).astype(int)
+                  
+                  response = {
+                      'anomaly_scores': scores.tolist(),
+                      'anomaly_labels': labels.tolist(),
+                      'threshold': float(threshold)
+                  }
+                  return json.dumps(response)
+              elif accept == 'text/csv':
+                  # Return CSV format
+                  scores = prediction[0]
+                  threshold = prediction[1] if len(prediction) > 1 else -0.5
+                  labels = (scores < threshold).astype(int)
+                  
+                  output = pd.DataFrame({
+                      'anomaly_score': scores,
+                      'anomaly_label': labels,
+                      'threshold': [threshold] * len(scores)
+                  })
+                  return output.to_csv(index=False)
+              else:
+                  raise ValueError(f"Unsupported accept type: {accept}")
+
+          # Prediction function
+          def predict_fn(input_data, model):
+              """Make prediction with the model."""
+              # Get anomaly scores
+              scores = model.score_samples(input_data)
+              # Get threshold (can be pre-computed or dynamic)
+              threshold = model.threshold_ if hasattr(model, 'threshold_') else -0.5
+              return [scores, threshold]
+          EOF
+
+      - name: Create model requirements file
+        run: |
+          cat > ai-observability/sagemaker/requirements.txt << EOF
+          numpy==1.24.3
+          pandas==2.0.2
+          scikit-learn==1.2.2
+          joblib==1.2.0
+          EOF
+
+      - name: Package SageMaker model
+        run: |
+          mkdir -p sagemaker-model/code
+          cp ai-observability/sagemaker/anomaly-detection-model.py sagemaker-model/code/
+          cp ai-observability/sagemaker/inference.py sagemaker-model/code/
+          cp ai-observability/sagemaker/requirements.txt sagemaker-model/code/
+          cp ai-observability/sagemaker/model-metadata.json sagemaker-model/
+          
+          # Create a dummy model for testing
+          python -c "
+          import joblib
+          import numpy as np
+          from sklearn.ensemble import IsolationForest
+          
+          # Create a simple model
+          model = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
+          X = np.random.randn(100, 1)
+          model.fit(X)
+          
+          # Add threshold attribute
+          model.threshold_ = -0.5
+          
+          # Save the model
+          joblib.dump(model, 'sagemaker-model/model.joblib')
+          "
+          
+          cd sagemaker-model
+          tar -czvf ../sagemaker-model.tar.gz .
+
+      - name: Upload SageMaker model artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sagemaker-model
+          path: sagemaker-model.tar.gz
+          retention-days: 7
+
+  deploy-model:
+    needs: [initialize, build-model]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 awscli
+
+      - name: Download SageMaker model artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: sagemaker-model
+          path: .
+
+      - name: Upload model to S3 and register in Model Registry
+        run: |
+          # Set variables
+          MODEL_BUCKET="${{ secrets.SAGEMAKER_MODEL_BUCKET }}"
+          MODEL_NAME="anomaly-detection-model"
+          MODEL_VERSION="${{ needs.initialize.outputs.model_version }}"
+          MODEL_GROUP_NAME="ecommerce-anomaly-detection-models"
+          ENVIRONMENT="${{ needs.initialize.outputs.environment }}"
+          TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
+          MODEL_PATH="models/${MODEL_NAME}/${ENVIRONMENT}/${MODEL_VERSION}/${TIMESTAMP}/model.tar.gz"
+          
+          # Upload model to S3
+          aws s3 cp sagemaker-model.tar.gz s3://${MODEL_BUCKET}/${MODEL_PATH}
+          
+          # Create model package group if it doesn't exist
+          aws sagemaker describe-model-package-group \
+            --model-package-group-name ${MODEL_GROUP_NAME} || \
+          aws sagemaker create-model-package-group \
+            --model-package-group-name ${MODEL_GROUP_NAME} \
+            --model-package-group-description "E-commerce anomaly detection models" \
+            --tags Key=Environment,Value=${ENVIRONMENT}
+          
+          # Create model package
+          MODEL_PACKAGE_ARN=$(aws sagemaker create-model-package \
+            --model-package-group-name ${MODEL_GROUP_NAME} \
+            --model-package-description "Anomaly detection model v${MODEL_VERSION}" \
+            --inference-specification '{
+              "Containers": [
+                {
+                  "Image": "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/sagemaker-scikit-learn:1.0-1",
+                  "ModelDataUrl": "s3://'${MODEL_BUCKET}'/'${MODEL_PATH}'",
+                  "Environment": {
+                    "SAGEMAKER_PROGRAM": "anomaly-detection-model.py",
+                    "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code",
+                    "SAGEMAKER_CONTAINER_LOG_LEVEL": "20"
+                  }
+                }
+              ],
+              "SupportedContentTypes": ["application/json", "text/csv"],
+              "SupportedResponseMIMETypes": ["application/json", "text/csv"],
+              "SupportedRealtimeInferenceInstanceTypes": ["ml.t2.medium", "ml.m5.large", "ml.m5.xlarge"]
+            }' \
+            --model-approval-status "Approved" \
+            --tags Key=Environment,Value=${ENVIRONMENT} Key=ModelVersion,Value=${MODEL_VERSION} \
+            --query "ModelPackageArn" --output text)
+          
+          echo "MODEL_PACKAGE_ARN=${MODEL_PACKAGE_ARN}" >> $GITHUB_ENV
+          
+          # Create SageMaker model from model package
+          MODEL_ARN=$(aws sagemaker create-model \
+            --model-name ${MODEL_NAME}-${ENVIRONMENT}-${TIMESTAMP} \
+            --execution-role-arn ${{ secrets.SAGEMAKER_ROLE_ARN }} \
+            --model-package-name ${MODEL_PACKAGE_ARN} \
+            --tags Key=Environment,Value=${ENVIRONMENT} Key=ModelVersion,Value=${MODEL_VERSION} \
+            --query "ModelArn" --output text)
+          
+          echo "MODEL_ARN=${MODEL_ARN}" >> $GITHUB_ENV
+          echo "MODEL_NAME=${MODEL_NAME}-${ENVIRONMENT}-${TIMESTAMP}" >> $GITHUB_ENV
+
+      - name: Create or update endpoint
+        run: |
+          # Set variables
+          ENDPOINT_NAME="ecommerce-anomaly-detector-${{ needs.initialize.outputs.environment }}"
+          ENDPOINT_CONFIG_NAME="${ENDPOINT_NAME}-config-$(date +%s)"
+          
+          # Create endpoint configuration
+          aws sagemaker create-endpoint-config \
+            --endpoint-config-name ${ENDPOINT_CONFIG_NAME} \
+            --production-variants '[{
+              "VariantName": "AllTraffic",
+              "ModelName": "'${MODEL_NAME}'",
+              "InitialInstanceCount": 1,
+              "InstanceType": "ml.m5.large",
+              "InitialVariantWeight": 1.0,
+              "ServerlessConfig": {
+                "MemorySizeInMB": 2048,
+                "MaxConcurrency": 5
+              }
+            }]' \
+            --tags Key=Environment,Value=${{ needs.initialize.outputs.environment }} Key=ModelVersion,Value=${{ needs.initialize.outputs.model_version }}
+          
+          # Check if endpoint exists
+          ENDPOINT_EXISTS=$(aws sagemaker describe-endpoint --endpoint-name ${ENDPOINT_NAME} 2>/dev/null && echo "true" || echo "false")
+          
+          if [ "${ENDPOINT_EXISTS}" == "true" ]; then
+            # Update existing endpoint
+            aws sagemaker update-endpoint \
+              --endpoint-name ${ENDPOINT_NAME} \
+              --endpoint-config-name ${ENDPOINT_CONFIG_NAME}
+            
+            echo "Updating existing endpoint: ${ENDPOINT_NAME}"
+          else
+            # Create new endpoint
+            aws sagemaker create-endpoint \
+              --endpoint-name ${ENDPOINT_NAME} \
+              --endpoint-config-name ${ENDPOINT_CONFIG_NAME} \
+              --tags Key=Environment,Value=${{ needs.initialize.outputs.environment }} Key=ModelVersion,Value=${{ needs.initialize.outputs.model_version }}
+            
+            echo "Creating new endpoint: ${ENDPOINT_NAME}"
+          fi
+          
+          # Wait for endpoint to be in service
+          aws sagemaker wait endpoint-in-service --endpoint-name ${ENDPOINT_NAME}
+          
+          echo "ENDPOINT_NAME=${ENDPOINT_NAME}" >> $GITHUB_ENV
+
+      - name: Test endpoint
+        run: |
+          # Test the endpoint with sample data
+          cat > test-data.json << EOF
+          [0.1, 0.2, 0.3, 5.0, 0.2, 0.1]
+          EOF
+          
+          # Invoke endpoint
+          aws sagemaker-runtime invoke-endpoint \
+            --endpoint-name ${ENDPOINT_NAME} \
+            --content-type application/json \
+            --accept application/json \
+            --body file://test-data.json \
+            response.json
+          
+          # Display response
+          cat response.json
+          
+          # Validate response format
+          python -c "
+          import json
+          with open('response.json', 'r') as f:
+              response = json.load(f)
+          assert 'anomaly_scores' in response, 'Response missing anomaly_scores'
+          assert 'anomaly_labels' in response, 'Response missing anomaly_labels'
+          assert 'threshold' in response, 'Response missing threshold'
+          print('Endpoint validation successful!')
+          "
+
+      - name: Create model monitoring schedule
+        run: |
+          # Create model monitoring schedule
+          aws sagemaker create-monitoring-schedule \
+            --monitoring-schedule-name ${ENDPOINT_NAME}-monitoring \
+            --monitoring-schedule-config '{
+              "ScheduleConfig": {
+                "ScheduleExpression": "cron(0 * ? * * *)"
+              },
+              "MonitoringJobDefinition": {
+                "BaselineConfig": {
+                  "ConstraintsResource": {
+                    "S3Uri": "s3://${{ secrets.SAGEMAKER_MODEL_BUCKET }}/monitoring/baselines/constraints.json"
+                  },
+                  "StatisticsResource": {
+                    "S3Uri": "s3://${{ secrets.SAGEMAKER_MODEL_BUCKET }}/monitoring/baselines/statistics.json"
+                  }
+                },
+                "MonitoringInputs": [
+                  {
+                    "EndpointInput": {
+                      "EndpointName": "'${ENDPOINT_NAME}'",
+                      "LocalPath": "/opt/ml/processing/input"
+                    }
+                  }
+                ],
+                "MonitoringOutputConfig": {
+                  "MonitoringOutputs": [
+                    {
+                      "S3Output": {
+                        "S3Uri": "s3://${{ secrets.SAGEMAKER_MODEL_BUCKET }}/monitoring/results",
+                        "LocalPath": "/opt/ml/processing/output"
+                      }
+                    }
+                  ]
+                },
+                "MonitoringResources": {
+                  "ClusterConfig": {
+                    "InstanceCount": 1,
+                    "InstanceType": "ml.m5.large",
+                    "VolumeSizeInGB": 20
+                  }
+                },
+                "RoleArn": "${{ secrets.SAGEMAKER_ROLE_ARN }}",
+                "StoppingCondition": {
+                  "MaxRuntimeInSeconds": 1800
+                }
+              }
+            }'
+
+      - name: Update Kubernetes ConfigMap
+        run: |
+          # Create ConfigMap for SageMaker endpoint information
+          cat > sagemaker-endpoints.yaml << EOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: sagemaker-endpoints
+            namespace: observability
+          data:
+            endpoints.json: |
+              {
+                "anomaly-detection": {
+                  "endpoint_name": "${ENDPOINT_NAME}",
+                  "model_name": "${MODEL_NAME}",
+                  "model_version": "${{ needs.initialize.outputs.model_version }}",
+                  "environment": "${{ needs.initialize.outputs.environment }}",
+                  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                  "region": "${{ env.AWS_REGION }}"
+                }
+              }
+          EOF
+          
+          # Apply ConfigMap to Kubernetes
+          kubectl apply -f sagemaker-endpoints.yaml
+
+  notify:
+    needs: [initialize, deploy-model]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: "SageMaker Model Deployment to ${{ needs.initialize.outputs.environment }} completed with status: ${{ job.status }}. Model Version: ${{ needs.initialize.outputs.model_version }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

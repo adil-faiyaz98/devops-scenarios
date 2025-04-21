@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenant-attribution-config
+  namespace: kubecost
+data:
+  tenant-attribution.json: |
+    {
+      "attributionConfigs": [
+        {
+          "name": "team-attribution",
+          "type": "namespace",
+          "aggregateBy": {
+            "label": "team",
+            "namespace": true
+          },
+          "filter": {
+            "namespace": {
+              "operator": "regex",
+              "values": ["^team.*"]
+            }
+          },
+          "costAllocationSettings": {
+            "shareTenantOverhead": true,
+            "shareIdleCosts": true,
+            "shareNamespaceOverhead": true,
+            "shareCostsByMetric": "cpu"
+          }
+        },
+        {
+          "name": "department-attribution",
+          "type": "label",
+          "aggregateBy": {
+            "label": "department"
+          },
+          "filter": {
+            "label": {
+              "key": "department",
+              "operator": "exists"
+            }
+          },
+          "costAllocationSettings": {
+            "shareTenantOverhead": true,
+            "shareIdleCosts": true,
+            "shareNamespaceOverhead": true,
+            "shareCostsByMetric": "cpu"
+          }
+        },
+        {
+          "name": "cost-center-attribution",
+          "type": "label",
+          "aggregateBy": {
+            "label": "cost-center"
+          },
+          "filter": {
+            "label": {
+              "key": "cost-center",
+              "operator": "exists"
+            }
+          },
+          "costAllocationSettings": {
+            "shareTenantOverhead": true,
+            "shareIdleCosts": true,
+            "shareNamespaceOverhead": true,
+            "shareCostsByMetric": "cpu"
+          }
+        }
+      ],
+      "defaultChargeback": {
+        "enabled": true,
+        "shareTenantOverhead": true,
+        "shareIdleCosts": true,
+        "shareNamespaceOverhead": true,
+        "shareCostsByMetric": "cpu"
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenant-budget-config
+  namespace: kubecost
+data:
+  tenant-budgets.json: |
+    {
+      "budgets": [
+        {
+          "name": "team1-budget",
+          "properties": {
+            "team": "team1"
+          },
+          "window": "monthly",
+          "aggregation": "namespace",
+          "filter": {
+            "namespace": {
+              "operator": "regex",
+              "values": ["^team1.*"]
+            }
+          },
+          "amount": 5000,
+          "currency": "USD"
+        },
+        {
+          "name": "team2-budget",
+          "properties": {
+            "team": "team2"
+          },
+          "window": "monthly",
+          "aggregation": "namespace",
+          "filter": {
+            "namespace": {
+              "operator": "regex",
+              "values": ["^team2.*"]
+            }
+          },
+          "amount": 3000,
+          "currency": "USD"
+        },
+        {
+          "name": "engineering-budget",
+          "properties": {
+            "department": "engineering"
+          },
+          "window": "monthly",
+          "aggregation": "label",
+          "filter": {
+            "label": {
+              "key": "department",
+              "operator": "equals",
+              "values": ["engineering"]
+            }
+          },
+          "amount": 10000,
+          "currency": "USD"
+        },
+        {
+          "name": "finance-budget",
+          "properties": {
+            "department": "finance"
+          },
+          "window": "monthly",
+          "aggregation": "label",
+          "filter": {
+            "label": {
+              "key": "department",
+              "operator": "equals",
+              "values": ["finance"]
+            }
+          },
+          "amount": 5000,
+          "currency": "USD"
+        }
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kubecost-chargeback-reporter
+  namespace: kubecost
+spec:
+  schedule: "0 0 1 * *"  # Run monthly on the 1st
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: kubecost-reporter
+            image: curlimages/curl:7.85.0
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Generate and distribute chargeback reports
+              curl -X POST "http://kubecost-cost-analyzer.kubecost.svc:9090/model/chargeback" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "window": "month",
+                  "aggregateBy": ["team", "department", "cost-center"],
+                  "step": "day",
+                  "idle": true,
+                  "shareIdle": true,
+                  "shareNamespaces": true,
+                  "shareTenants": true,
+                  "format": "csv",
+                  "email": true,
+                  "sendTo": ["platform-team@example.com"]
+                }'
+          restartPolicy: OnFailure

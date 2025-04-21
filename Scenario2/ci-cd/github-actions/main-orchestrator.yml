@@ -49,18 +49,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: SAST Scan
         uses: github/codeql-action/analyze@v2
-        
+
       - name: Secret Scanning
         uses: gitleaks/gitleaks-action@v2
-        
+
       - name: Dependencies Scan
         run: |
           npm audit
           pip audit
-          
+
       - name: Infrastructure Scan
         uses: aquasecurity/tfsec-action@v1.0.0
         with:
@@ -72,25 +72,25 @@ jobs:
     environment: ${{ needs.initialize.outputs.environment }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Configure Cloud Credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_PRIMARY_REGION }}
-      
+
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      
+
       - name: Deploy Base Infrastructure
         run: |
           cd infrastructure/terraform
           terraform init
           terraform apply -auto-approve
-      
+
       - name: Configure Networking
         run: |
           ./scripts/configure-network.sh
@@ -103,12 +103,12 @@ jobs:
       - name: Deploy OPA Policies
         run: |
           kubectl apply -f security/policies/
-      
+
       - name: Configure WAF Rules
         run: |
           aws wafv2 put-logging-configuration
           az network application-gateway waf-config set
-      
+
       - name: Setup Identity Federation
         run: |
           ./scripts/configure-identity.sh
@@ -123,11 +123,11 @@ jobs:
           helm repo add grafana https://grafana.github.io/helm-charts
           helm install prometheus prometheus-community/kube-prometheus-stack
           helm install grafana grafana/grafana
-      
+
       - name: Configure Alerts
         run: |
           kubectl apply -f monitoring/alerts/
-          
+
       - name: Setup Log Aggregation
         run: |
           helm install datadog datadog/datadog
@@ -140,14 +140,14 @@ jobs:
       - name: Build Application
         run: |
           docker build -t app:${{ github.sha }} .
-          
+
       - name: Security Scan Image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'app:${{ github.sha }}'
           format: 'table'
           exit-code: '1'
-          
+
       - name: Deploy Application
         run: |
           helm upgrade --install app ./charts/app \
@@ -158,52 +158,308 @@ jobs:
     needs: [initialize, application-deployment]
     runs-on: ubuntu-latest
     steps:
-      - name: Configure DR
-        run: |
-          ./scripts/configure-dr.sh
-          
-      - name: Setup Replication
-        run: |
-          ./scripts/setup-replication.sh
-          
-      - name: Verify DR Setup
-        run: |
-          ./scripts/verify-dr.sh
+      - uses: actions/checkout@v3
 
-  compliance-verification:
+      # Configure comprehensive disaster recovery setup
+      - name: Configure DR Infrastructure
+        run: |
+          echo "Configuring disaster recovery infrastructure for ${{ needs.initialize.outputs.environment }}"
+
+          # Configure AWS DR infrastructure
+          aws_secondary_region="us-west-2"
+
+          # Configure Azure DR infrastructure
+          azure_secondary_region="westeurope"
+
+          # Set up cross-region infrastructure
+          ./scripts/dr/configure-aws-dr.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region $aws_secondary_region \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          ./scripts/dr/configure-azure-dr.sh \
+            --primary-region ${{ env.AZURE_PRIMARY_REGION }} \
+            --secondary-region $azure_secondary_region \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+      # Set up data replication mechanisms
+      - name: Setup Data Replication
+        run: |
+          # Configure database replication
+          ./scripts/dr/setup-db-replication.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # Configure storage replication
+          ./scripts/dr/setup-storage-replication.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # Configure message queue replication
+          ./scripts/dr/setup-queue-replication.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+      # Set up automated failover mechanisms
+      - name: Configure Automated Failover
+        run: |
+          # Configure Route53 health checks and failover routing
+          ./scripts/dr/configure-dns-failover.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # Configure Azure Traffic Manager
+          ./scripts/dr/configure-traffic-manager.sh \
+            --primary-region ${{ env.AZURE_PRIMARY_REGION }} \
+            --secondary-region westeurope \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # Configure cross-cloud failover
+          ./scripts/dr/configure-cross-cloud-failover.sh \
+            --aws-region ${{ env.AWS_PRIMARY_REGION }} \
+            --azure-region ${{ env.AZURE_PRIMARY_REGION }} \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+      # Comprehensive DR testing
+      - name: Run DR Tests
+        run: |
+          echo "Running comprehensive DR tests for ${{ needs.initialize.outputs.environment }}"
+
+          # 1. Data replication validation test
+          ./scripts/dr/test-data-replication.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 2. RTO validation test (should be < 5 minutes)
+          ./scripts/dr/test-rto.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }} \
+            --max-rto 300
+
+          # 3. RPO validation test (should be < 1 minute)
+          ./scripts/dr/test-rpo.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }} \
+            --max-rpo 60
+
+          # 4. Automated failover test
+          ./scripts/dr/test-automated-failover.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 5. Cross-cloud failover test
+          ./scripts/dr/test-cross-cloud-failover.sh \
+            --aws-region ${{ env.AWS_PRIMARY_REGION }} \
+            --azure-region ${{ env.AZURE_PRIMARY_REGION }} \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+      # Simulated disaster recovery exercise
+      - name: Simulated DR Exercise
+        if: github.event.inputs.deployment_type == 'dr-test'
+        run: |
+          echo "Running full simulated DR exercise for ${{ needs.initialize.outputs.environment }}"
+
+          # 1. Simulate primary region failure
+          ./scripts/dr/simulate-region-failure.sh \
+            --region ${{ env.AWS_PRIMARY_REGION }} \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 2. Verify automatic failover to secondary region
+          ./scripts/dr/verify-failover.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 3. Run application validation tests in DR environment
+          ./scripts/dr/validate-dr-environment.sh \
+            --region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 4. Simulate recovery of primary region
+          ./scripts/dr/simulate-region-recovery.sh \
+            --region ${{ env.AWS_PRIMARY_REGION }} \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+          # 5. Test failback to primary region
+          ./scripts/dr/test-failback.sh \
+            --primary-region ${{ env.AWS_PRIMARY_REGION }} \
+            --secondary-region us-west-2 \
+            --environment ${{ needs.initialize.outputs.environment }}
+
+      # Generate DR test report
+      - name: Generate DR Test Report
+        run: |
+          # Collect all DR test results
+          mkdir -p reports/dr-tests
+          cp dr-test-*.json reports/dr-tests/
+
+          # Generate detailed HTML report
+          ./scripts/dr/generate-dr-report.sh \
+            --environment ${{ needs.initialize.outputs.environment }} \
+            --output reports/dr-tests/dr-test-report.html \
+            --json reports/dr-tests/dr-test-report.json
+
+          # Generate executive summary
+          ./scripts/dr/generate-dr-executive-summary.sh \
+            --input reports/dr-tests/dr-test-report.json \
+            --output reports/dr-tests/dr-executive-summary.pdf
+
+      # Archive DR test results
+      - name: Archive DR Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dr-test-reports
+          path: reports/dr-tests/
+
+  pci-dss-compliance-verification:
     needs: [initialize, application-deployment, dr-configuration]
     runs-on: ubuntu-latest
     steps:
-      - name: Run Compliance Checks
+      - uses: actions/checkout@v3
+
+      # Comprehensive PCI-DSS compliance scanning
+      - name: Run PCI-DSS Compliance Scans
         run: |
-          ./scripts/verify-compliance.sh
-          
-      - name: Generate Compliance Report
+          # Install PCI-DSS compliance scanning tools
+          pip install pcidss-compliance-scanner
+          npm install -g pci-audit
+
+          # Run comprehensive PCI-DSS compliance scans
+          echo "Running PCI-DSS compliance scans for ${{ needs.initialize.outputs.environment }} environment"
+
+          # 1. Network Security Scan (PCI-DSS Req 1, 2)
+          ./scripts/pci-dss/scan-network-security.sh --environment ${{ needs.initialize.outputs.environment }}
+
+          # 2. Data Protection Scan (PCI-DSS Req 3, 4)
+          ./scripts/pci-dss/scan-data-protection.sh --environment ${{ needs.initialize.outputs.environment }}
+
+          # 3. Vulnerability Management Scan (PCI-DSS Req 5, 6)
+          ./scripts/pci-dss/scan-vulnerability-mgmt.sh --environment ${{ needs.initialize.outputs.environment }}
+
+          # 4. Access Control Scan (PCI-DSS Req 7, 8, 9)
+          ./scripts/pci-dss/scan-access-control.sh --environment ${{ needs.initialize.outputs.environment }}
+
+          # 5. Network Monitoring Scan (PCI-DSS Req 10, 11)
+          ./scripts/pci-dss/scan-network-monitoring.sh --environment ${{ needs.initialize.outputs.environment }}
+
+          # 6. Security Policy Scan (PCI-DSS Req 12)
+          ./scripts/pci-dss/scan-security-policy.sh --environment ${{ needs.initialize.outputs.environment }}
+
+      # Detailed PCI-DSS requirement validation
+      - name: Validate PCI-DSS Requirements
         run: |
-          ./scripts/generate-compliance-report.sh
-          
+          # Requirement 1: Install and maintain a firewall configuration
+          aws ec2 describe-security-groups --region ${{ env.AWS_PRIMARY_REGION }} > security-groups.json
+          ./scripts/pci-dss/validate-req1.sh --input security-groups.json
+
+          # Requirement 2: Do not use vendor-supplied defaults
+          ./scripts/pci-dss/validate-req2.sh
+
+          # Requirement 3: Protect stored cardholder data
+          aws kms list-keys --region ${{ env.AWS_PRIMARY_REGION }} > kms-keys.json
+          aws rds describe-db-instances --region ${{ env.AWS_PRIMARY_REGION }} > rds-instances.json
+          ./scripts/pci-dss/validate-req3.sh --kms kms-keys.json --rds rds-instances.json
+
+          # Requirement 4: Encrypt transmission of cardholder data
+          ./scripts/pci-dss/validate-req4.sh
+
+          # Requirement 5: Use and regularly update anti-virus
+          ./scripts/pci-dss/validate-req5.sh
+
+          # Requirement 6: Develop and maintain secure systems
+          ./scripts/pci-dss/validate-req6.sh
+
+          # Requirement 7: Restrict access to cardholder data
+          aws iam list-roles > iam-roles.json
+          ./scripts/pci-dss/validate-req7.sh --iam iam-roles.json
+
+          # Requirement 8: Assign unique ID to each person with computer access
+          ./scripts/pci-dss/validate-req8.sh
+
+          # Requirement 9: Restrict physical access to cardholder data
+          ./scripts/pci-dss/validate-req9.sh
+
+          # Requirement 10: Track and monitor access
+          aws cloudtrail describe-trails --region ${{ env.AWS_PRIMARY_REGION }} > cloudtrail.json
+          ./scripts/pci-dss/validate-req10.sh --cloudtrail cloudtrail.json
+
+          # Requirement 11: Regularly test security systems and processes
+          ./scripts/pci-dss/validate-req11.sh
+
+          # Requirement 12: Maintain information security policy
+          ./scripts/pci-dss/validate-req12.sh
+
+      # Generate comprehensive compliance report
+      - name: Generate PCI-DSS Compliance Report
+        run: |
+          # Collect all scan results
+          mkdir -p reports/compliance/pci-dss
+          cp pci-dss-scan-*.json reports/compliance/pci-dss/
+
+          # Generate detailed HTML report
+          ./scripts/pci-dss/generate-report.sh \
+            --environment ${{ needs.initialize.outputs.environment }} \
+            --output reports/compliance/pci-dss-report.html \
+            --json reports/compliance/pci-dss-report.json
+
+          # Generate executive summary
+          ./scripts/pci-dss/generate-executive-summary.sh \
+            --input reports/compliance/pci-dss-report.json \
+            --output reports/compliance/pci-dss-executive-summary.pdf
+
+      # Validate compliance with other financial regulations
+      - name: Additional Financial Compliance Checks
+        run: |
+          # SOX compliance checks
+          ./scripts/compliance/check-sox-compliance.sh
+
+          # GDPR compliance for financial data
+          ./scripts/compliance/check-gdpr-compliance.sh
+
+          # GLBA compliance checks
+          ./scripts/compliance/check-glba-compliance.sh
+
+      # Archive detailed compliance results
       - name: Archive Compliance Results
         uses: actions/upload-artifact@v3
         with:
-          name: compliance-report
+          name: compliance-reports
           path: reports/compliance/
 
+      # Notify security team of compliance status
+      - name: Notify Security Team
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SECURITY_SLACK_CHANNEL_ID }}
+          slack-message: "PCI-DSS Compliance scan for ${{ needs.initialize.outputs.environment }} completed with status: ${{ job.status }}. Report available in artifacts."
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
   deployment-verification:
-    needs: [initialize, application-deployment, dr-configuration, compliance-verification]
+    needs: [initialize, application-deployment, dr-configuration, pci-dss-compliance-verification]
     runs-on: ubuntu-latest
     steps:
       - name: Health Checks
         run: |
           ./scripts/verify-deployment.sh
-          
+
       - name: Load Testing
         run: |
           k6 run performance/load-test.js
-          
+
       - name: Integration Tests
         run: |
           npm run integration-tests
-          
+
       - name: Generate Deployment Report
         if: always()
         run: |
@@ -219,7 +475,7 @@ jobs:
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: "Deployment to ${{ needs.initialize.outputs.environment }} completed with status: ${{ job.status }}"
-          
+
       - name: Update JIRA
         if: github.event_name != 'pull_request'
         run: |
@@ -233,7 +489,7 @@ jobs:
       - name: Cleanup Resources
         run: |
           ./scripts/cleanup-temporary-resources.sh
-          
+
       - name: Archive Logs
         uses: actions/upload-artifact@v3
         with:

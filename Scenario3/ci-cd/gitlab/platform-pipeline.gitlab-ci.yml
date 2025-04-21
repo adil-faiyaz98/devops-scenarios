@@ -1,0 +1,354 @@
+stages:
+  - validate
+  - security
+  - cluster
+  - platform
+  - monitoring
+  - tenant
+  - verify
+
+variables:
+  TF_VERSION: "1.5.7"
+  KUBECTL_VERSION: "1.27.3"
+  HELM_VERSION: "3.13.1"
+  ARGOCD_VERSION: "2.8.0"
+  AWS_REGION: "us-east-1"
+  DEPLOYMENT_ID: ${CI_PIPELINE_ID}
+
+# Default to dev environment
+.set_environment: &set_environment
+  before_script:
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "main" ]]; then
+        export ENVIRONMENT="prod"
+      elif [[ "$CI_COMMIT_BRANCH" == "staging" ]]; then
+        export ENVIRONMENT="qa"
+      else
+        export ENVIRONMENT="dev"
+      fi
+      echo "Deploying to $ENVIRONMENT environment"
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+# Validate infrastructure code
+validate:
+  stage: validate
+  image: hashicorp/terraform:${TF_VERSION}
+  script:
+    - cd clusters/terraform
+    - terraform init -backend=false
+    - terraform validate
+    - terraform fmt -check -recursive
+    - cd ../../
+    - |
+      # Install kubeval
+      curl -L https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+      mv kubeval /usr/local/bin
+      # Validate Kubernetes manifests
+      find gitops -name "*.yaml" -type f -exec kubeval {} \;
+    - |
+      # Install Helm
+      curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 get_helm.sh
+      ./get_helm.sh --version ${HELM_VERSION}
+      # Validate Helm charts
+      find . -path "*/charts/*" -type f -name "Chart.yaml" | while read chart; do
+        chart_dir=$(dirname "$chart")
+        echo "Validating Helm chart in $chart_dir"
+        helm lint "$chart_dir"
+      done
+
+# Security scanning
+security_scan:
+  stage: security
+  image: aquasec/tfsec:latest
+  script:
+    - tfsec clusters/terraform
+    - |
+      # Install Trivy
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      # Scan Kubernetes manifests
+      trivy config --exit-code 1 .
+
+# Deploy EKS cluster
+deploy_cluster:
+  stage: cluster
+  image: hashicorp/terraform:${TF_VERSION}
+  <<: *set_environment
+  script:
+    - apt-get update && apt-get install -y curl unzip
+    - |
+      # Install AWS CLI
+      curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      unzip awscliv2.zip
+      ./aws/install
+    - |
+      # Configure AWS credentials
+      aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+      aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+      aws configure set region ${AWS_REGION}
+    - |
+      # Deploy EKS cluster
+      cd clusters/terraform/${ENVIRONMENT}
+      terraform init
+      terraform plan -out=tfplan
+      terraform apply -auto-approve tfplan
+    - |
+      # Configure kubectl
+      curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      mv kubectl /usr/local/bin/
+      aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+    - |
+      # Apply Calico network policies
+      kubectl apply -f security/network-policies/calico-installation.yaml
+      kubectl wait --for=condition=available --timeout=5m deployment/calico-kube-controllers -n kube-system
+    - |
+      # Verify cluster deployment
+      kubectl get nodes
+      kubectl get pods -A
+      kubectl cluster-info
+  environment:
+    name: ${ENVIRONMENT}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Deploy platform services
+deploy_platform_services:
+  stage: platform
+  image: alpine:latest
+  <<: *set_environment
+  script:
+    - apk add --no-cache curl bash aws-cli
+    - |
+      # Install kubectl
+      curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      mv kubectl /usr/local/bin/
+      aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+    - |
+      # Install Helm
+      curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 get_helm.sh
+      ./get_helm.sh --version ${HELM_VERSION}
+    - |
+      # Install ArgoCD
+      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v${ARGOCD_VERSION}/manifests/install.yaml
+      kubectl wait --for=condition=available --timeout=5m deployment/argocd-server -n argocd
+      # Apply ArgoCD configuration
+      kubectl apply -f gitops/argocd/application-sets.yaml
+      kubectl apply -f gitops/argocd/env-promotion.yaml
+    - |
+      # Install Istio Service Mesh
+      curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.18.0 sh -
+      ./istio-1.18.0/bin/istioctl install -f service-mesh/istio/istio-${ENVIRONMENT}.yaml -y
+      kubectl apply -f service-mesh/istio/gateway.yaml
+      # Apply mTLS policies
+      kubectl apply -f service-mesh/tenant-policies/default-mtls.yaml
+    - |
+      # Install NGINX Ingress Controller
+      helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      helm repo update
+      helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+        --namespace ingress-nginx --create-namespace \
+        -f ingress/nginx/values-${ENVIRONMENT}.yaml
+      # Apply ingress configurations
+      kubectl apply -f ingress/nginx/ingress-classes.yaml
+    - |
+      # Install HashiCorp Vault
+      helm repo add hashicorp https://helm.releases.hashicorp.com
+      helm repo update
+      helm upgrade --install vault hashicorp/vault \
+        --namespace vault --create-namespace \
+        -f security/vault/values-${ENVIRONMENT}.yaml
+      # Initialize and configure Vault
+      ./security/vault/init-vault.sh --environment ${ENVIRONMENT}
+    - |
+      # Configure OIDC integration
+      kubectl apply -f security/oidc/oidc-config.yaml
+      # Configure RBAC with Azure AD
+      kubectl apply -f security/rbac/azure-ad-integration.yaml
+      kubectl apply -f security/rbac/cluster-roles.yaml
+  environment:
+    name: ${ENVIRONMENT}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Deploy monitoring stack
+deploy_monitoring:
+  stage: monitoring
+  image: alpine:latest
+  <<: *set_environment
+  script:
+    - apk add --no-cache curl bash aws-cli
+    - |
+      # Install kubectl
+      curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      mv kubectl /usr/local/bin/
+      aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+    - |
+      # Install Helm
+      curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 get_helm.sh
+      ./get_helm.sh --version ${HELM_VERSION}
+    - |
+      # Install Prometheus and Grafana
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      helm repo add grafana https://grafana.github.io/helm-charts
+      helm repo update
+      # Install Prometheus
+      helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+        --namespace monitoring --create-namespace \
+        -f monitoring/prometheus/values-${ENVIRONMENT}.yaml
+      # Install Grafana
+      helm upgrade --install grafana grafana/grafana \
+        --namespace monitoring \
+        -f monitoring/grafana/values-${ENVIRONMENT}.yaml
+      # Apply Grafana dashboards
+      kubectl apply -f monitoring/grafana/dashboards/
+    - |
+      # Install Kubecost for cost monitoring
+      helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+      helm repo update
+      helm upgrade --install kubecost kubecost/cost-analyzer \
+        --namespace kubecost --create-namespace \
+        -f monitoring/cost/kubecost-values-${ENVIRONMENT}.yaml
+      # Configure Kubecost for tenant-level cost attribution
+      kubectl apply -f monitoring/cost/tenant-attribution.yaml
+    - |
+      # Configure tenant-specific monitoring
+      kubectl apply -f monitoring/tenant-monitoring/tenant-prometheus-rules.yaml
+      kubectl apply -f monitoring/tenant-monitoring/tenant-grafana-dashboards.yaml
+    - |
+      # Set up alerts and notifications
+      kubectl apply -f monitoring/alertmanager/alertmanager-config.yaml
+      kubectl apply -f monitoring/alertmanager/alert-rules.yaml
+  environment:
+    name: ${ENVIRONMENT}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Onboard tenants
+tenant_onboarding:
+  stage: tenant
+  image: alpine:latest
+  <<: *set_environment
+  script:
+    - apk add --no-cache curl bash aws-cli
+    - |
+      # Install kubectl
+      curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      mv kubectl /usr/local/bin/
+      aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+    - |
+      # Run tenant onboarding script
+      # Onboard example tenants
+      ./tenant-onboarding/onboard.sh team1 ${ENVIRONMENT} engineering cost-center-123 engineering-dept
+      ./tenant-onboarding/onboard.sh team2 ${ENVIRONMENT} finance cost-center-456 finance-dept
+      # Verify tenant namespaces
+      kubectl get namespaces | grep team
+      # Verify tenant RBAC
+      kubectl get rolebindings -A | grep team
+    - |
+      # Configure tenant network policies
+      kubectl apply -f security/network-policies/tenant-network-policies.yaml
+    - |
+      # Configure tenant service mesh policies
+      kubectl apply -f service-mesh/tenant-policies/tenant-authorization-policies.yaml
+    - |
+      # Configure tenant resource quotas
+      kubectl apply -f tenant-onboarding/resource-quotas.yaml
+  environment:
+    name: ${ENVIRONMENT}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# Verify deployment
+verify_deployment:
+  stage: verify
+  image: alpine:latest
+  <<: *set_environment
+  script:
+    - apk add --no-cache curl bash aws-cli
+    - |
+      # Install kubectl
+      curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      mv kubectl /usr/local/bin/
+      aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+    - |
+      # Verify cluster health
+      kubectl get nodes
+      kubectl get pods -A
+      kubectl cluster-info
+    - |
+      # Verify ArgoCD deployment
+      kubectl get pods -n argocd
+      kubectl get applications -n argocd
+    - |
+      # Verify Istio deployment
+      kubectl get pods -n istio-system
+      kubectl get gateways -A
+      kubectl get virtualservices -A
+    - |
+      # Verify NGINX Ingress deployment
+      kubectl get pods -n ingress-nginx
+      kubectl get ingressclasses
+    - |
+      # Verify Vault deployment
+      kubectl get pods -n vault
+      kubectl get services -n vault
+    - |
+      # Verify monitoring deployment
+      kubectl get pods -n monitoring
+      kubectl get pods -n kubecost
+      kubectl get servicemonitors -A
+      kubectl get prometheusrules -A
+    - |
+      # Verify tenant onboarding
+      kubectl get namespaces | grep team
+      kubectl get rolebindings -A | grep team
+      kubectl get networkpolicies -A | grep team
+      kubectl get resourcequotas -A | grep team
+    - |
+      # Generate verification report
+      mkdir -p reports
+      echo "# Platform Verification Report" > reports/verification-report.md
+      echo "Environment: ${ENVIRONMENT}" >> reports/verification-report.md
+      echo "Deployment ID: ${DEPLOYMENT_ID}" >> reports/verification-report.md
+      echo "Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> reports/verification-report.md
+      echo "" >> reports/verification-report.md
+      
+      echo "## Cluster Status" >> reports/verification-report.md
+      kubectl get nodes -o wide >> reports/verification-report.md
+      echo "" >> reports/verification-report.md
+      
+      echo "## Platform Services Status" >> reports/verification-report.md
+      kubectl get pods -A >> reports/verification-report.md
+      echo "" >> reports/verification-report.md
+      
+      echo "## Tenant Status" >> reports/verification-report.md
+      kubectl get namespaces | grep team >> reports/verification-report.md
+      echo "" >> reports/verification-report.md
+  artifacts:
+    paths:
+      - reports/verification-report.md
+    expire_in: 1 week
+  environment:
+    name: ${ENVIRONMENT}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'

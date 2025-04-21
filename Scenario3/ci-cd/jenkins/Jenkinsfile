@@ -1,0 +1,411 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: platform-pipeline
+spec:
+  containers:
+  - name: terraform
+    image: hashicorp/terraform:1.5.7
+    command:
+    - cat
+    tty: true
+  - name: kubectl
+    image: bitnami/kubectl:1.27.3
+    command:
+    - cat
+    tty: true
+  - name: helm
+    image: alpine/helm:3.13.1
+    command:
+    - cat
+    tty: true
+  - name: aws
+    image: amazon/aws-cli:2.13.10
+    command:
+    - cat
+    tty: true
+  - name: istio
+    image: istio/istioctl:1.18.0
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'prod'], description: 'Target environment for deployment')
+        choice(name: 'DEPLOYMENT_TYPE', choices: ['full', 'cluster-only', 'platform-services-only', 'tenant-onboarding'], description: 'Type of deployment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        DEPLOYMENT_ID = sh(script: 'date +%s', returnStdout: true).trim()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                container('terraform') {
+                    sh '''
+                        cd clusters/terraform
+                        terraform init -backend=false
+                        terraform validate
+                        terraform fmt -check -recursive
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Install kubeval
+                        curl -L https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+                        mv kubeval /usr/local/bin
+                        # Validate Kubernetes manifests
+                        find gitops -name "*.yaml" -type f -exec kubeval {} \\;
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Validate Helm charts
+                        find . -path "*/charts/*" -type f -name "Chart.yaml" | while read chart; do
+                          chart_dir=$(dirname "$chart")
+                          echo "Validating Helm chart in $chart_dir"
+                          helm lint "$chart_dir"
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                sh '''
+                    # Install tfsec
+                    curl -L https://github.com/aquasecurity/tfsec/releases/download/v1.28.1/tfsec-linux-amd64 -o tfsec
+                    chmod +x tfsec
+                    mv tfsec /usr/local/bin/
+                    
+                    # Scan Terraform code
+                    tfsec clusters/terraform
+                    
+                    # Install Trivy
+                    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                    
+                    # Scan Kubernetes manifests
+                    trivy config --exit-code 0 .
+                '''
+            }
+        }
+
+        stage('Deploy Cluster') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'cluster-only' }
+            }
+            steps {
+                container('terraform') {
+                    withCredentials([
+                        string(credentialsId: 'aws-access-key', variable: 'AWS_ACCESS_KEY_ID'),
+                        string(credentialsId: 'aws-secret-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                    ]) {
+                        sh '''
+                            cd clusters/terraform/${ENVIRONMENT}
+                            terraform init
+                            terraform plan -out=tfplan
+                            terraform apply -auto-approve tfplan
+                        '''
+                    }
+                }
+                
+                container('aws') {
+                    withCredentials([
+                        string(credentialsId: 'aws-access-key', variable: 'AWS_ACCESS_KEY_ID'),
+                        string(credentialsId: 'aws-secret-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                    ]) {
+                        sh '''
+                            aws eks update-kubeconfig --name eks-${ENVIRONMENT} --region ${AWS_REGION}
+                        '''
+                    }
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Apply Calico network policies
+                        kubectl apply -f security/network-policies/calico-installation.yaml
+                        kubectl wait --for=condition=available --timeout=5m deployment/calico-kube-controllers -n kube-system
+                        
+                        # Verify cluster deployment
+                        kubectl get nodes
+                        kubectl get pods -A
+                        kubectl cluster-info
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Platform Services') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'platform-services-only' }
+            }
+            steps {
+                container('kubectl') {
+                    sh '''
+                        # Install ArgoCD
+                        kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.8.0/manifests/install.yaml
+                        kubectl wait --for=condition=available --timeout=5m deployment/argocd-server -n argocd
+                        
+                        # Apply ArgoCD configuration
+                        kubectl apply -f gitops/argocd/application-sets.yaml
+                        kubectl apply -f gitops/argocd/env-promotion.yaml
+                        
+                        # Configure OIDC integration
+                        kubectl apply -f security/oidc/oidc-config.yaml
+                        
+                        # Configure RBAC with Azure AD
+                        kubectl apply -f security/rbac/azure-ad-integration.yaml
+                        kubectl apply -f security/rbac/cluster-roles.yaml
+                    '''
+                }
+                
+                container('istio') {
+                    sh '''
+                        # Install Istio Service Mesh
+                        istioctl install -f service-mesh/istio/istio-${ENVIRONMENT}.yaml -y
+                        kubectl apply -f service-mesh/istio/gateway.yaml
+                        
+                        # Apply mTLS policies
+                        kubectl apply -f service-mesh/tenant-policies/default-mtls.yaml
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Install NGINX Ingress Controller
+                        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+                        helm repo update
+                        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \\
+                          --namespace ingress-nginx --create-namespace \\
+                          -f ingress/nginx/values-${ENVIRONMENT}.yaml
+                        
+                        # Apply ingress configurations
+                        kubectl apply -f ingress/nginx/ingress-classes.yaml
+                        
+                        # Install HashiCorp Vault
+                        helm repo add hashicorp https://helm.releases.hashicorp.com
+                        helm repo update
+                        helm upgrade --install vault hashicorp/vault \\
+                          --namespace vault --create-namespace \\
+                          -f security/vault/values-${ENVIRONMENT}.yaml
+                    '''
+                }
+                
+                sh '''
+                    # Initialize and configure Vault
+                    ./security/vault/init-vault.sh --environment ${ENVIRONMENT}
+                '''
+            }
+        }
+
+        stage('Deploy Monitoring') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'platform-services-only' }
+            }
+            steps {
+                container('helm') {
+                    sh '''
+                        # Install Prometheus and Grafana
+                        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                        helm repo add grafana https://grafana.github.io/helm-charts
+                        helm repo update
+                        
+                        # Install Prometheus
+                        helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \\
+                          --namespace monitoring --create-namespace \\
+                          -f monitoring/prometheus/values-${ENVIRONMENT}.yaml
+                        
+                        # Install Grafana
+                        helm upgrade --install grafana grafana/grafana \\
+                          --namespace monitoring \\
+                          -f monitoring/grafana/values-${ENVIRONMENT}.yaml
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Apply Grafana dashboards
+                        kubectl apply -f monitoring/grafana/dashboards/
+                    '''
+                }
+                
+                container('helm') {
+                    sh '''
+                        # Install Kubecost for cost monitoring
+                        helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+                        helm repo update
+                        helm upgrade --install kubecost kubecost/cost-analyzer \\
+                          --namespace kubecost --create-namespace \\
+                          -f monitoring/cost/kubecost-values-${ENVIRONMENT}.yaml
+                    '''
+                }
+                
+                container('kubectl') {
+                    sh '''
+                        # Configure Kubecost for tenant-level cost attribution
+                        kubectl apply -f monitoring/cost/tenant-attribution.yaml
+                        
+                        # Configure tenant-specific monitoring
+                        kubectl apply -f monitoring/tenant-monitoring/tenant-prometheus-rules.yaml
+                        kubectl apply -f monitoring/tenant-monitoring/tenant-grafana-dashboards.yaml
+                        
+                        # Set up alerts and notifications
+                        kubectl apply -f monitoring/alertmanager/alertmanager-config.yaml
+                        kubectl apply -f monitoring/alertmanager/alert-rules.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Tenant Onboarding') {
+            when {
+                expression { return params.DEPLOYMENT_TYPE == 'full' || params.DEPLOYMENT_TYPE == 'tenant-onboarding' }
+            }
+            steps {
+                sh '''
+                    # Run tenant onboarding script
+                    # Onboard example tenants
+                    ./tenant-onboarding/onboard.sh team1 ${ENVIRONMENT} engineering cost-center-123 engineering-dept
+                    ./tenant-onboarding/onboard.sh team2 ${ENVIRONMENT} finance cost-center-456 finance-dept
+                '''
+                
+                container('kubectl') {
+                    sh '''
+                        # Verify tenant namespaces
+                        kubectl get namespaces | grep team
+                        
+                        # Verify tenant RBAC
+                        kubectl get rolebindings -A | grep team
+                        
+                        # Configure tenant network policies
+                        kubectl apply -f security/network-policies/tenant-network-policies.yaml
+                        
+                        # Configure tenant service mesh policies
+                        kubectl apply -f service-mesh/tenant-policies/tenant-authorization-policies.yaml
+                        
+                        # Configure tenant resource quotas
+                        kubectl apply -f tenant-onboarding/resource-quotas.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Verification') {
+            steps {
+                container('kubectl') {
+                    sh '''
+                        # Verify cluster health
+                        kubectl get nodes
+                        kubectl get pods -A
+                        kubectl cluster-info
+                        
+                        # Verify ArgoCD deployment
+                        kubectl get pods -n argocd
+                        kubectl get applications -n argocd
+                        
+                        # Verify Istio deployment
+                        kubectl get pods -n istio-system
+                        kubectl get gateways -A
+                        kubectl get virtualservices -A
+                        
+                        # Verify NGINX Ingress deployment
+                        kubectl get pods -n ingress-nginx
+                        kubectl get ingressclasses
+                        
+                        # Verify Vault deployment
+                        kubectl get pods -n vault
+                        kubectl get services -n vault
+                        
+                        # Verify monitoring deployment
+                        kubectl get pods -n monitoring
+                        kubectl get pods -n kubecost
+                        kubectl get servicemonitors -A
+                        kubectl get prometheusrules -A
+                        
+                        # Verify tenant onboarding
+                        kubectl get namespaces | grep team
+                        kubectl get rolebindings -A | grep team
+                        kubectl get networkpolicies -A | grep team
+                        kubectl get resourcequotas -A | grep team
+                    '''
+                }
+                
+                sh '''
+                    # Generate verification report
+                    mkdir -p reports
+                    echo "# Platform Verification Report" > reports/verification-report.md
+                    echo "Environment: ${ENVIRONMENT}" >> reports/verification-report.md
+                    echo "Deployment ID: ${DEPLOYMENT_ID}" >> reports/verification-report.md
+                    echo "Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> reports/verification-report.md
+                    echo "" >> reports/verification-report.md
+                    
+                    echo "## Cluster Status" >> reports/verification-report.md
+                    kubectl get nodes -o wide >> reports/verification-report.md
+                    echo "" >> reports/verification-report.md
+                    
+                    echo "## Platform Services Status" >> reports/verification-report.md
+                    kubectl get pods -A >> reports/verification-report.md
+                    echo "" >> reports/verification-report.md
+                    
+                    echo "## Tenant Status" >> reports/verification-report.md
+                    kubectl get namespaces | grep team >> reports/verification-report.md
+                    echo "" >> reports/verification-report.md
+                '''
+                
+                // Archive verification report
+                archiveArtifacts artifacts: 'reports/verification-report.md', allowEmptyArchive: false
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Sending notifications...'
+            
+            script {
+                def message = "Enterprise Kubernetes Platform deployment to ${params.ENVIRONMENT} completed with status: ${currentBuild.currentResult}"
+                
+                // Send Slack notification
+                slackSend(
+                    channel: '#platform-deployments',
+                    color: currentBuild.currentResult == 'SUCCESS' ? 'good' : 'danger',
+                    message: message
+                )
+                
+                // Update JIRA ticket
+                def jiraIssueKey = "PLATFORM-123"
+                jiraAddComment(
+                    idOrKey: jiraIssueKey,
+                    comment: message
+                )
+            }
+        }
+    }
+}

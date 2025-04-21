@@ -1,0 +1,138 @@
+## Kubecost cost monitoring configuration for dev environment
+
+global:
+  prometheus:
+    enabled: false
+    fqdn: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+
+kubecostProductConfigs:
+  clusterName: "eks-dev"
+
+  # Enable tenant-level cost attribution
+  labelMappingConfigs:
+    enabled: true
+    owner_label: "owner"
+    team_label: "team"
+    department_label: "department"
+    product_label: "product"
+    environment_label: "environment"
+    namespace_external_label: "kubernetes_namespace"
+    cluster_external_label: "kubernetes_cluster"
+    
+  # Enable cost allocation
+  allocation:
+    enabled: true
+    # Allocate costs by namespace, pod, and label
+    allocationConfigs:
+      - name: "namespace"
+        type: "namespace"
+        enabled: true
+      - name: "pod"
+        type: "pod"
+        enabled: true
+      - name: "label"
+        type: "label"
+        enabled: true
+        labelConfig:
+          labels:
+            - "team"
+            - "department"
+            - "cost-center"
+            - "app"
+            - "environment"
+
+  # Enable AWS integration
+  cloudIntegration:
+    enabled: true
+    aws:
+      enabled: true
+      athenaIntegration:
+        enabled: true
+        athenaBucketName: "kubecost-athena-dev"
+        athenaRegion: "us-east-1"
+        athenaDatabase: "kubecost"
+        athenaTable: "kubecost"
+        athenaWorkgroup: "primary"
+      
+  # Enable chargeback reports
+  reporting:
+    enabled: true
+    # Generate daily and monthly reports
+    configs:
+      - name: "daily-team-report"
+        type: "team"
+        schedule: "0 0 * * *" # Daily at midnight
+        format: "csv"
+        destination: "s3://kubecost-reports-dev/daily/"
+      - name: "monthly-department-report"
+        type: "department"
+        schedule: "0 0 1 * *" # Monthly on the 1st
+        format: "csv"
+        destination: "s3://kubecost-reports-dev/monthly/"
+
+  # Enable Slack notifications for cost anomalies
+  notifications:
+    enabled: true
+    slack:
+      enabled: true
+      webhook: "${SLACK_WEBHOOK_URL}"
+      channel: "#kubecost-alerts-dev"
+    
+    # Configure cost anomaly detection
+    alertConfigs:
+      - name: "daily-spend-increase"
+        type: "budget"
+        threshold: 1.2 # 20% increase
+        window: "daily"
+        aggregation: "namespace"
+      - name: "monthly-budget-threshold"
+        type: "budget"
+        threshold: 0.8 # 80% of budget
+        window: "monthly"
+        aggregation: "team"
+
+# Configure Grafana integration
+grafana:
+  enabled: false
+  proxy: false
+  fqdn: http://grafana.monitoring.svc:3000
+  user: "admin"
+  password: "${GRAFANA_PASSWORD}"
+  
+  # Automatically create Kubecost dashboards in Grafana
+  dashboards:
+    enabled: true
+    namespace: "monitoring"
+    label: "grafana_dashboard"
+
+# Configure RBAC for Kubecost
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/kubecost-dev-role"
+
+# Configure ingress for Kubecost UI
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: kubecost-dev.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: kubecost-tls
+      hosts:
+        - kubecost-dev.example.com
+
+# Configure resource requests and limits
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 2Gi

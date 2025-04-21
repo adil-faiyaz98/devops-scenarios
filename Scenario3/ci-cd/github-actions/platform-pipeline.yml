@@ -1,0 +1,468 @@
+name: Enterprise Kubernetes Platform CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'clusters/**'
+      - 'gitops/**'
+      - 'security/**'
+      - 'service-mesh/**'
+      - 'ingress/**'
+      - 'monitoring/**'
+      - 'tenant-onboarding/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      deployment_type:
+        description: 'Deployment Type'
+        required: true
+        type: choice
+        options:
+          - full
+          - cluster-only
+          - platform-services-only
+          - tenant-onboarding
+
+env:
+  TF_VERSION: '1.5.7'
+  KUBECTL_VERSION: '1.27.3'
+  HELM_VERSION: '3.13.1'
+  ARGOCD_VERSION: '2.8.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_id: ${{ steps.init.outputs.deployment_id }}
+      environment: ${{ steps.init.outputs.environment }}
+    steps:
+      - id: init
+        run: |
+          echo "deployment_id=$(date +%s)" >> $GITHUB_OUTPUT
+          echo "environment=${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Validate Terraform configurations
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Validate Terraform
+        run: |
+          cd clusters/terraform
+          terraform init -backend=false
+          terraform validate
+          terraform fmt -check -recursive
+      
+      # Validate Kubernetes manifests
+      - name: Validate Kubernetes Manifests
+        uses: kubernetes-sigs/kubeval-action@v1
+        with:
+          files: gitops/argocd/applications
+      
+      # Validate Helm charts
+      - name: Validate Helm Charts
+        run: |
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh --version ${{ env.HELM_VERSION }}
+          
+          find . -path "*/charts/*" -type f -name "Chart.yaml" | while read chart; do
+            chart_dir=$(dirname "$chart")
+            echo "Validating Helm chart in $chart_dir"
+            helm lint "$chart_dir"
+          done
+
+  security-scan:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Scan Terraform code
+      - name: Terraform Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false
+      
+      # Scan Kubernetes manifests
+      - name: Kubernetes Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      # Scan for secrets
+      - name: Secret Scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Upload scan results
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-results'
+
+  cluster-deployment:
+    needs: [initialize, security-scan]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.deployment_type == 'full' || github.event.inputs.deployment_type == 'cluster-only' || github.event.inputs.deployment_type == null
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Configure AWS credentials
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      # Deploy EKS cluster
+      - name: Deploy EKS Cluster
+        run: |
+          cd clusters/terraform/${{ needs.initialize.outputs.environment }}
+          terraform init
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+      
+      # Configure kubectl
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name eks-${{ needs.initialize.outputs.environment }} --region ${{ env.AWS_REGION }}
+      
+      # Apply Calico network policies
+      - name: Deploy Calico
+        run: |
+          kubectl apply -f security/network-policies/calico-installation.yaml
+          kubectl wait --for=condition=available --timeout=5m deployment/calico-kube-controllers -n kube-system
+      
+      # Verify cluster deployment
+      - name: Verify Cluster Deployment
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+          kubectl cluster-info
+
+  platform-services-deployment:
+    needs: [initialize, cluster-deployment]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.deployment_type == 'full' || github.event.inputs.deployment_type == 'platform-services-only' || github.event.inputs.deployment_type == null
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Configure kubectl
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name eks-${{ needs.initialize.outputs.environment }} --region ${{ env.AWS_REGION }}
+      
+      # Install ArgoCD
+      - name: Deploy ArgoCD
+        run: |
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v${{ env.ARGOCD_VERSION }}/manifests/install.yaml
+          kubectl wait --for=condition=available --timeout=5m deployment/argocd-server -n argocd
+          
+          # Apply ArgoCD configuration
+          kubectl apply -f gitops/argocd/application-sets.yaml
+          kubectl apply -f gitops/argocd/env-promotion.yaml
+      
+      # Install Istio Service Mesh
+      - name: Deploy Istio
+        run: |
+          curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.18.0 sh -
+          ./istio-1.18.0/bin/istioctl install -f service-mesh/istio/istio-${{ needs.initialize.outputs.environment }}.yaml -y
+          kubectl apply -f service-mesh/istio/gateway.yaml
+          
+          # Apply mTLS policies
+          kubectl apply -f service-mesh/tenant-policies/default-mtls.yaml
+      
+      # Install NGINX Ingress Controller
+      - name: Deploy NGINX Ingress
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx --create-namespace \
+            -f ingress/nginx/values-${{ needs.initialize.outputs.environment }}.yaml
+          
+          # Apply ingress configurations
+          kubectl apply -f ingress/nginx/ingress-classes.yaml
+      
+      # Install Vault for secrets management
+      - name: Deploy HashiCorp Vault
+        run: |
+          helm repo add hashicorp https://helm.releases.hashicorp.com
+          helm repo update
+          helm upgrade --install vault hashicorp/vault \
+            --namespace vault --create-namespace \
+            -f security/vault/values-${{ needs.initialize.outputs.environment }}.yaml
+          
+          # Initialize and configure Vault
+          ./security/vault/init-vault.sh --environment ${{ needs.initialize.outputs.environment }}
+      
+      # Configure OIDC integration
+      - name: Configure OIDC Integration
+        run: |
+          kubectl apply -f security/oidc/oidc-config.yaml
+          
+          # Configure RBAC with Azure AD
+          kubectl apply -f security/rbac/azure-ad-integration.yaml
+          kubectl apply -f security/rbac/cluster-roles.yaml
+
+  monitoring-deployment:
+    needs: [initialize, platform-services-deployment]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.deployment_type == 'full' || github.event.inputs.deployment_type == 'platform-services-only' || github.event.inputs.deployment_type == null
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Configure kubectl
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name eks-${{ needs.initialize.outputs.environment }} --region ${{ env.AWS_REGION }}
+      
+      # Install Prometheus and Grafana
+      - name: Deploy Prometheus and Grafana
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          
+          # Install Prometheus
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring --create-namespace \
+            -f monitoring/prometheus/values-${{ needs.initialize.outputs.environment }}.yaml
+          
+          # Install Grafana
+          helm upgrade --install grafana grafana/grafana \
+            --namespace monitoring \
+            -f monitoring/grafana/values-${{ needs.initialize.outputs.environment }}.yaml
+          
+          # Apply Grafana dashboards
+          kubectl apply -f monitoring/grafana/dashboards/
+      
+      # Install Kubecost for cost monitoring
+      - name: Deploy Kubecost
+        run: |
+          helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+          helm repo update
+          helm upgrade --install kubecost kubecost/cost-analyzer \
+            --namespace kubecost --create-namespace \
+            -f monitoring/cost/kubecost-values-${{ needs.initialize.outputs.environment }}.yaml
+          
+          # Configure Kubecost for tenant-level cost attribution
+          kubectl apply -f monitoring/cost/tenant-attribution.yaml
+      
+      # Configure tenant-specific monitoring
+      - name: Configure Tenant Monitoring
+        run: |
+          kubectl apply -f monitoring/tenant-monitoring/tenant-prometheus-rules.yaml
+          kubectl apply -f monitoring/tenant-monitoring/tenant-grafana-dashboards.yaml
+      
+      # Set up alerts and notifications
+      - name: Configure Alerting
+        run: |
+          kubectl apply -f monitoring/alertmanager/alertmanager-config.yaml
+          kubectl apply -f monitoring/alertmanager/alert-rules.yaml
+
+  tenant-onboarding:
+    needs: [initialize, monitoring-deployment]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.deployment_type == 'full' || github.event.inputs.deployment_type == 'tenant-onboarding'
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Configure kubectl
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name eks-${{ needs.initialize.outputs.environment }} --region ${{ env.AWS_REGION }}
+      
+      # Run tenant onboarding script
+      - name: Onboard Sample Tenants
+        run: |
+          # Onboard example tenants
+          ./tenant-onboarding/onboard.sh team1 ${{ needs.initialize.outputs.environment }} engineering cost-center-123 engineering-dept
+          ./tenant-onboarding/onboard.sh team2 ${{ needs.initialize.outputs.environment }} finance cost-center-456 finance-dept
+          
+          # Verify tenant namespaces
+          kubectl get namespaces | grep team
+          
+          # Verify tenant RBAC
+          kubectl get rolebindings -A | grep team
+      
+      # Configure tenant network policies
+      - name: Configure Tenant Network Policies
+        run: |
+          kubectl apply -f security/network-policies/tenant-network-policies.yaml
+      
+      # Configure tenant service mesh policies
+      - name: Configure Tenant Service Mesh Policies
+        run: |
+          kubectl apply -f service-mesh/tenant-policies/tenant-authorization-policies.yaml
+      
+      # Configure tenant resource quotas
+      - name: Configure Tenant Resource Quotas
+        run: |
+          kubectl apply -f tenant-onboarding/resource-quotas.yaml
+
+  verification:
+    needs: [initialize, tenant-onboarding]
+    runs-on: ubuntu-latest
+    if: always() && (needs.cluster-deployment.result == 'success' || needs.platform-services-deployment.result == 'success' || needs.monitoring-deployment.result == 'success' || needs.tenant-onboarding.result == 'success')
+    environment: ${{ needs.initialize.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Configure kubectl
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name eks-${{ needs.initialize.outputs.environment }} --region ${{ env.AWS_REGION }}
+      
+      # Verify cluster health
+      - name: Verify Cluster Health
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+          kubectl cluster-info
+      
+      # Verify ArgoCD deployment
+      - name: Verify ArgoCD
+        run: |
+          kubectl get pods -n argocd
+          kubectl get applications -n argocd
+      
+      # Verify Istio deployment
+      - name: Verify Istio
+        run: |
+          kubectl get pods -n istio-system
+          kubectl get gateways -A
+          kubectl get virtualservices -A
+      
+      # Verify NGINX Ingress deployment
+      - name: Verify NGINX Ingress
+        run: |
+          kubectl get pods -n ingress-nginx
+          kubectl get ingressclasses
+      
+      # Verify Vault deployment
+      - name: Verify Vault
+        run: |
+          kubectl get pods -n vault
+          kubectl get services -n vault
+      
+      # Verify monitoring deployment
+      - name: Verify Monitoring
+        run: |
+          kubectl get pods -n monitoring
+          kubectl get pods -n kubecost
+          kubectl get servicemonitors -A
+          kubectl get prometheusrules -A
+      
+      # Verify tenant onboarding
+      - name: Verify Tenant Onboarding
+        run: |
+          kubectl get namespaces | grep team
+          kubectl get rolebindings -A | grep team
+          kubectl get networkpolicies -A | grep team
+          kubectl get resourcequotas -A | grep team
+      
+      # Generate verification report
+      - name: Generate Verification Report
+        run: |
+          mkdir -p reports
+          echo "# Platform Verification Report" > reports/verification-report.md
+          echo "Environment: ${{ needs.initialize.outputs.environment }}" >> reports/verification-report.md
+          echo "Deployment ID: ${{ needs.initialize.outputs.deployment_id }}" >> reports/verification-report.md
+          echo "Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> reports/verification-report.md
+          echo "" >> reports/verification-report.md
+          
+          echo "## Cluster Status" >> reports/verification-report.md
+          kubectl get nodes -o wide >> reports/verification-report.md
+          echo "" >> reports/verification-report.md
+          
+          echo "## Platform Services Status" >> reports/verification-report.md
+          kubectl get pods -A >> reports/verification-report.md
+          echo "" >> reports/verification-report.md
+          
+          echo "## Tenant Status" >> reports/verification-report.md
+          kubectl get namespaces | grep team >> reports/verification-report.md
+          echo "" >> reports/verification-report.md
+      
+      # Archive verification report
+      - name: Archive Verification Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: verification-report
+          path: reports/verification-report.md
+
+  notification:
+    needs: [verification]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: "Enterprise Kubernetes Platform deployment to ${{ needs.initialize.outputs.environment }} completed with status: ${{ job.status }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      
+      - name: Update JIRA
+        if: github.event_name != 'pull_request'
+        run: |
+          # Update JIRA ticket with deployment status
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "Enterprise Kubernetes Platform deployment to ${{ needs.initialize.outputs.environment }} completed with status: ${{ job.status }}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }' \
+            https://your-company.atlassian.net/rest/api/3/issue/${{ secrets.JIRA_TICKET_ID }}/comment
