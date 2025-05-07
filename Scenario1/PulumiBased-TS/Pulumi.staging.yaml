@@ -1,0 +1,20 @@
+config:
+  aws:region: us-west-2
+  enterprise-multi-project-cicd:environment: staging
+  enterprise-multi-project-cicd:clusterName: enterprise-staging
+  enterprise-multi-project-cicd:nodeSize: t3.large
+  enterprise-multi-project-cicd:minNodes: 3
+  enterprise-multi-project-cicd:maxNodes: 10
+  enterprise-multi-project-cicd:desiredCapacity: 5
+  enterprise-multi-project-cicd:regions:
+    - us-west-2
+    - us-east-1
+  enterprise-multi-project-cicd:domain: staging.example.com
+  enterprise-multi-project-cicd:enableMonitoring: true
+  enterprise-multi-project-cicd:enableTracing: true
+  enterprise-multi-project-cicd:enableLogging: true
+  enterprise-multi-project-cicd:enableVault: true
+  enterprise-multi-project-cicd:enableNetworkPolicies: true
+  enterprise-multi-project-cicd:alertingEmail: devops@example.com
+  enterprise-multi-project-cicd:slackWebhook: 
+    secure: AAABAFiJ2y6Ux+Q9n0Xg/XaGWRrLxKIhwcYtFiJ2y6Ux+Q9n0Xg/XaGWRrLxKIhwcYt=

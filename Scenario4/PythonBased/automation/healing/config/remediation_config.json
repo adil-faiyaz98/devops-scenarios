@@ -1,0 +1,223 @@
+{
+  "dedupe_window_seconds": 300,
+  "rate_limit": 10,
+  "retry_interval_seconds": 60,
+  "max_retries": 3,
+  
+  "circuit_breaker": {
+    "api_url": "http://api-gateway:8080",
+    "api_key": "${CIRCUIT_BREAKER_API_KEY}"
+  },
+  
+  "kubernetes": {
+    "namespace": "ecommerce",
+    "context": "ecommerce-cluster",
+    "config_path": "/etc/kubernetes/config"
+  },
+  
+  "remediation_actions": [
+    {
+      "name": "scale_up_deployment",
+      "description": "Scale up a Kubernetes deployment",
+      "severity": "medium",
+      "enabled": true,
+      "requires_approval": false,
+      "applicable_issues": [
+        "high_cpu_usage",
+        "high_memory_usage",
+        "high_request_rate"
+      ],
+      "parameters": {
+        "scale_factor": 1.5,
+        "min_increment": 1,
+        "max_replicas": 10
+      }
+    },
+    {
+      "name": "restart_pod",
+      "description": "Restart a problematic pod",
+      "severity": "medium",
+      "enabled": true,
+      "requires_approval": false,
+      "applicable_issues": [
+        "memory_leak",
+        "stuck_process",
+        "high_error_rate"
+      ],
+      "parameters": {
+        "grace_period_seconds": 30
+      }
+    },
+    {
+      "name": "circuit_breaker",
+      "description": "Enable circuit breaker for a failing dependency",
+      "severity": "high",
+      "enabled": true,
+      "requires_approval": true,
+      "applicable_issues": [
+        "dependency_failure",
+        "high_latency",
+        "timeout"
+      ],
+      "parameters": {
+        "timeout_seconds": 300,
+        "failure_threshold": 0.5,
+        "reset_timeout_seconds": 60
+      }
+    },
+    {
+      "name": "rollback_deployment",
+      "description": "Rollback a deployment to a previous version",
+      "severity": "critical",
+      "enabled": true,
+      "requires_approval": true,
+      "applicable_issues": [
+        "deployment_failure",
+        "critical_error_rate",
+        "service_outage"
+      ],
+      "parameters": {
+        "revision": "previous",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "name": "adjust_resource_limits",
+      "description": "Adjust resource limits for a deployment",
+      "severity": "medium",
+      "enabled": true,
+      "requires_approval": false,
+      "applicable_issues": [
+        "resource_constraint",
+        "oom_killed",
+        "throttled_cpu"
+      ],
+      "parameters": {
+        "cpu_increment": "100m",
+        "memory_increment": "256Mi",
+        "max_cpu": "2000m",
+        "max_memory": "4Gi"
+      }
+    },
+    {
+      "name": "purge_cache",
+      "description": "Purge cache for a service",
+      "severity": "low",
+      "enabled": true,
+      "requires_approval": false,
+      "applicable_issues": [
+        "cache_inconsistency",
+        "stale_data"
+      ],
+      "parameters": {
+        "cache_keys": ["all"],
+        "async": true
+      }
+    },
+    {
+      "name": "toggle_feature_flag",
+      "description": "Toggle a feature flag",
+      "severity": "medium",
+      "enabled": true,
+      "requires_approval": true,
+      "applicable_issues": [
+        "feature_error",
+        "performance_degradation"
+      ],
+      "parameters": {
+        "default_state": false,
+        "temporary": true,
+        "duration_minutes": 60
+      }
+    },
+    {
+      "name": "scale_database",
+      "description": "Scale database resources",
+      "severity": "high",
+      "enabled": true,
+      "requires_approval": true,
+      "applicable_issues": [
+        "database_bottleneck",
+        "high_db_cpu",
+        "high_db_memory",
+        "high_db_connections"
+      ],
+      "parameters": {
+        "instance_type": "next_tier",
+        "storage_increment_gb": 50,
+        "max_connections_increment": 100
+      }
+    },
+    {
+      "name": "add_rate_limiting",
+      "description": "Add rate limiting to an endpoint",
+      "severity": "medium",
+      "enabled": true,
+      "requires_approval": false,
+      "applicable_issues": [
+        "api_abuse",
+        "ddos_attack",
+        "high_request_rate"
+      ],
+      "parameters": {
+        "rate_limit": 100,
+        "per_seconds": 60,
+        "burst": 20
+      }
+    },
+    {
+      "name": "block_ip",
+      "description": "Block an IP address",
+      "severity": "high",
+      "enabled": true,
+      "requires_approval": true,
+      "applicable_issues": [
+        "security_threat",
+        "brute_force_attack",
+        "api_abuse"
+      ],
+      "parameters": {
+        "duration_hours": 24,
+        "notify_security_team": true
+      }
+    }
+  ],
+  
+  "approval_channels": {
+    "slack": {
+      "webhook_url": "${SLACK_APPROVAL_WEBHOOK_URL}",
+      "channel": "#remediation-approvals",
+      "timeout_seconds": 300
+    },
+    "email": {
+      "recipients": [
+        "sre-team@example.com",
+        "security-team@example.com"
+      ],
+      "timeout_seconds": 600
+    },
+    "pagerduty": {
+      "service_id": "${PAGERDUTY_SERVICE_ID}",
+      "timeout_seconds": 300
+    }
+  },
+  
+  "notification_channels": {
+    "slack": {
+      "webhook_url": "${SLACK_NOTIFICATION_WEBHOOK_URL}",
+      "channel": "#auto-remediation"
+    },
+    "email": {
+      "recipients": [
+        "sre-team@example.com"
+      ]
+    }
+  },
+  
+  "audit_logging": {
+    "enabled": true,
+    "log_level": "INFO",
+    "retention_days": 90,
+    "include_request_response": true
+  }
+}

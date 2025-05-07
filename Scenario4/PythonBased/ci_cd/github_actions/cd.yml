@@ -1,0 +1,166 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Install Pulumi CLI
+      uses: pulumi/setup-pulumi@v2
+    
+    - name: Preview infrastructure changes
+      run: |
+        pulumi stack select ${{ github.event.inputs.environment }}
+        pulumi preview
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    
+    - name: Deploy infrastructure
+      run: |
+        pulumi stack select ${{ github.event.inputs.environment }}
+        pulumi up --yes
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    
+    - name: Run integration tests
+      run: |
+        pytest tests/integration
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-east-1
+    
+    - name: Run performance tests
+      if: github.event.inputs.environment == 'staging'
+      run: |
+        pytest tests/performance
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-east-1
+    
+    - name: Notify Slack on success
+      uses: rtCamp/action-slack-notify@v2
+      if: success()
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_CHANNEL: deployments
+        SLACK_COLOR: good
+        SLACK_TITLE: Deployment Successful
+        SLACK_MESSAGE: |
+          :white_check_mark: Successfully deployed to ${{ github.event.inputs.environment }}
+          
+          Environment: ${{ github.event.inputs.environment }}
+          Triggered by: ${{ github.actor }}
+          Commit: ${{ github.sha }}
+    
+    - name: Notify Slack on failure
+      uses: rtCamp/action-slack-notify@v2
+      if: failure()
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_CHANNEL: deployments
+        SLACK_COLOR: danger
+        SLACK_TITLE: Deployment Failed
+        SLACK_MESSAGE: |
+          :x: Failed to deploy to ${{ github.event.inputs.environment }}
+          
+          Environment: ${{ github.event.inputs.environment }}
+          Triggered by: ${{ github.actor }}
+          Commit: ${{ github.sha }}
+  
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Install Pulumi CLI
+      uses: pulumi/setup-pulumi@v2
+    
+    - name: Rollback to previous version
+      run: |
+        pulumi stack select ${{ github.event.inputs.environment }}
+        pulumi stack history --show-secrets=false
+        LAST_SUCCESSFUL_VERSION=$(pulumi stack history --json | jq -r '[.[] | select(.result == "succeeded") | .version][1]')
+        if [ -n "$LAST_SUCCESSFUL_VERSION" ]; then
+          echo "Rolling back to version $LAST_SUCCESSFUL_VERSION"
+          pulumi stack history --show-secrets=false
+          pulumi stack select ${{ github.event.inputs.environment }}
+          pulumi up --yes --target-version $LAST_SUCCESSFUL_VERSION
+        else
+          echo "No previous successful version found. Cannot rollback."
+          exit 1
+        fi
+      env:
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    
+    - name: Notify Slack on rollback
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_CHANNEL: deployments
+        SLACK_COLOR: warning
+        SLACK_TITLE: Deployment Rolled Back
+        SLACK_MESSAGE: |
+          :rewind: Rolled back deployment to ${{ github.event.inputs.environment }}
+          
+          Environment: ${{ github.event.inputs.environment }}
+          Triggered by: ${{ github.actor }}
+          Commit: ${{ github.sha }}

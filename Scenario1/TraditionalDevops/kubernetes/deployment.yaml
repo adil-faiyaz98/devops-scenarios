@@ -54,8 +54,8 @@ spec:
             cpu: 200m
             memory: 256Mi
           limits:
-            cpu: 1
-            memory: 1Gi
+            cpu: 500m
+            memory: 512Mi
         # Environment variables
         env:
         - name: NODE_ENV
@@ -205,6 +205,9 @@ metadata:
   name: ${SERVICE_NAME}
   namespace: ${NAMESPACE}
 spec:
+  podSelector:
+    matchLabels:
+      app: ${SERVICE_NAME}
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment

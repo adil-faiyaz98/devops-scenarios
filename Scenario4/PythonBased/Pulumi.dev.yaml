@@ -1,0 +1,31 @@
+config:
+  ai-observability:environment: dev
+  ai-observability:projectName: ai-observability
+  ai-observability:domain: dev.ai-observability.example.com
+  ai-observability:vpcCidr: 10.0.0.0/16
+  ai-observability:availabilityZones:
+    - us-east-1a
+    - us-east-1b
+    - us-east-1c
+  ai-observability:privateSubnetCidrs:
+    - 10.0.1.0/24
+    - 10.0.2.0/24
+    - 10.0.3.0/24
+  ai-observability:publicSubnetCidrs:
+    - 10.0.101.0/24
+    - 10.0.102.0/24
+    - 10.0.103.0/24
+  ai-observability:kubernetesVersion: "1.24"
+  ai-observability:systemNodeInstanceType: m5.xlarge
+  ai-observability:systemNodeMinSize: 2
+  ai-observability:systemNodeMaxSize: 4
+  ai-observability:systemNodeDesiredSize: 2
+  ai-observability:appNodeInstanceType: m5.2xlarge
+  ai-observability:appNodeMinSize: 2
+  ai-observability:appNodeMaxSize: 10
+  ai-observability:appNodeDesiredSize: 3
+  ai-observability:mlNodeInstanceType: g4dn.xlarge
+  ai-observability:mlNodeMinSize: 0
+  ai-observability:mlNodeMaxSize: 2
+  ai-observability:mlNodeDesiredSize: 1
+  aws:region: us-east-1

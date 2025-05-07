@@ -1,0 +1,6 @@
+name: ai-observability
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: AI-driven Observability Pipeline for E-commerce

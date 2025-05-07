@@ -1,0 +1,11 @@
+name: enterprise-multi-project-cicd
+runtime: nodejs
+description: Enterprise Multi-Project CI/CD Pipeline with Pulumi
+config:
+  aws:region: us-west-2
+  kubernetes:version: 1.27
+  organization: adil-faiyaz98
+  gitops:repository: devops-dojo-gitops
+  monitoring:enabled: true
+  security:enabled: true
+  tracing:enabled: true

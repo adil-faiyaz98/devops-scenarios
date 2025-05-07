@@ -1,0 +1,149 @@
+# Alert Manager Configuration
+
+# General settings
+dedupe_window_seconds: 300  # 5 minutes
+rate_limit: 20  # 20 alerts per minute
+retry_interval_seconds: 60  # 1 minute
+max_retries: 3
+
+# Alert channels
+channels:
+  # Slack channel for all alerts
+  - name: general-slack
+    type: slack
+    enabled: true
+    config:
+      webhook_url: "${SLACK_WEBHOOK_URL}"
+      channel: "#alerts"
+
+  # Slack channel for critical alerts
+  - name: critical-slack
+    type: slack
+    enabled: true
+    severity_filter:
+      - critical
+    config:
+      webhook_url: "${SLACK_WEBHOOK_URL}"
+      channel: "#critical-alerts"
+
+  # PagerDuty for high and critical alerts
+  - name: pagerduty
+    type: pagerduty
+    enabled: true
+    severity_filter:
+      - error
+      - critical
+    config:
+      integration_key: "${PAGERDUTY_INTEGRATION_KEY}"
+      api_token: "${PAGERDUTY_API_TOKEN}"
+
+  # Email for daily digest
+  - name: email-digest
+    type: email
+    enabled: true
+    config:
+      smtp_server: "smtp.example.com"
+      smtp_port: 587
+      username: "${EMAIL_USERNAME}"
+      password: "${EMAIL_PASSWORD}"
+      from_email: "alerts@example.com"
+      to_emails:
+        - "team@example.com"
+        - "manager@example.com"
+
+  # Webhook for integration with other systems
+  - name: webhook
+    type: webhook
+    enabled: true
+    config:
+      webhook_url: "https://api.example.com/webhooks/alerts"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${WEBHOOK_API_KEY}"
+
+# Alert templates
+templates:
+  # Anomaly detection alert
+  anomaly:
+    title: "Anomaly Detected: {service} - {metric}"
+    message: "An anomaly was detected in {service} for metric {metric}. Current value: {value}, expected range: {lower_bound} - {upper_bound}."
+    severity: "warning"
+    tags:
+      - "anomaly"
+      - "ml"
+      - "observability"
+
+  # Predictive alert
+  predictive:
+    title: "Predicted Issue: {service} - {metric}"
+    message: "A potential issue is predicted in {service} for metric {metric} in {time_until} hours. Confidence: {confidence}%."
+    severity: "info"
+    tags:
+      - "predictive"
+      - "ml"
+      - "observability"
+
+  # Service health alert
+  service_health:
+    title: "Service Health Issue: {service}"
+    message: "Service {service} is experiencing health issues. Status: {status}."
+    severity: "error"
+    tags:
+      - "service-health"
+      - "infrastructure"
+
+  # Resource utilization alert
+  resource_utilization:
+    title: "High Resource Utilization: {service} - {resource}"
+    message: "Service {service} is experiencing high {resource} utilization ({value}%)."
+    severity: "warning"
+    tags:
+      - "resource"
+      - "infrastructure"
+
+  # Security alert
+  security:
+    title: "Security Alert: {type}"
+    message: "A security issue of type {type} was detected. Source: {source}."
+    severity: "critical"
+    tags:
+      - "security"
+      - "threat"
+
+  # Dependency failure alert
+  dependency_failure:
+    title: "Dependency Failure: {service} -> {dependency}"
+    message: "Service {service} is experiencing issues with dependency {dependency}. Error rate: {error_rate}%."
+    severity: "error"
+    tags:
+      - "dependency"
+      - "infrastructure"
+
+  # Fraud detection alert
+  fraud:
+    title: "Potential Fraud Detected: {transaction_id}"
+    message: "Potential fraudulent activity detected for transaction {transaction_id}. Risk score: {risk_score}."
+    severity: "critical"
+    tags:
+      - "fraud"
+      - "security"
+      - "business"
+
+  # Inventory alert
+  inventory:
+    title: "Inventory Alert: {product}"
+    message: "Product {product} inventory level is {level}, which is below the threshold of {threshold}."
+    severity: "warning"
+    tags:
+      - "inventory"
+      - "business"
+
+  # Intrusion detection alert
+  intrusion:
+    title: "Intrusion Attempt Detected: {source_ip}"
+    message: "Potential intrusion attempt detected from {source_ip}. Attack type: {attack_type}."
+    severity: "critical"
+    tags:
+      - "intrusion"
+      - "security"
+      - "threat"

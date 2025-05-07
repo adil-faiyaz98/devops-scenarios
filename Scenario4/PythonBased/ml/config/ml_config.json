@@ -1,0 +1,207 @@
+{
+  "model_base_path": "/opt/observability/models",
+  "monitoring_interval_seconds": 3600,
+  "retraining_interval_days": 7,
+  "performance_threshold": 0.8,
+  
+  "anomaly_detector": {
+    "isolation_forest": {
+      "n_estimators": 100,
+      "contamination": 0.01,
+      "random_state": 42
+    },
+    "prophet": {
+      "changepoint_prior_scale": 0.05,
+      "seasonality_prior_scale": 10.0,
+      "seasonality_mode": "multiplicative"
+    },
+    "anomaly_threshold": 0.95,
+    "seasonality_enabled": true,
+    "trend_enabled": true,
+    "use_multivariate": true
+  },
+  
+  "root_cause_analyzer": {
+    "correlation_threshold": 0.7,
+    "causality_threshold": 0.6,
+    "max_causes": 5,
+    "time_window": 300,
+    "random_forest": {
+      "n_estimators": 100,
+      "max_depth": 10,
+      "random_state": 42
+    }
+  },
+  
+  "predictive_alerting": {
+    "forecast_horizon": 24,
+    "forecast_frequency": "5min",
+    "alert_threshold": 0.9,
+    "min_confidence": 0.7,
+    "prophet": {
+      "changepoint_prior_scale": 0.05,
+      "seasonality_prior_scale": 10.0,
+      "seasonality_mode": "multiplicative",
+      "interval_width": 0.95
+    },
+    "isolation_forest": {
+      "n_estimators": 100,
+      "max_samples": "auto",
+      "contamination": 0.01,
+      "random_state": 42
+    }
+  },
+  
+  "fraud_detector": {
+    "risk_threshold": 0.7,
+    "high_risk_threshold": 0.9,
+    "user_history_window": 30,
+    "random_forest": {
+      "n_estimators": 100,
+      "max_depth": 10,
+      "random_state": 42
+    },
+    "xgboost": {
+      "n_estimators": 100,
+      "max_depth": 5,
+      "learning_rate": 0.1,
+      "random_state": 42
+    },
+    "isolation_forest": {
+      "n_estimators": 100,
+      "contamination": 0.01,
+      "random_state": 42
+    }
+  },
+  
+  "inventory_optimizer": {
+    "forecast_horizon": 90,
+    "safety_stock_z_value": 1.96,
+    "min_safety_stock_days": 7,
+    "max_safety_stock_days": 30,
+    "prophet": {
+      "changepoint_prior_scale": 0.05,
+      "seasonality_prior_scale": 10.0,
+      "seasonality_mode": "multiplicative",
+      "interval_width": 0.95
+    },
+    "random_forest": {
+      "n_estimators": 100,
+      "max_depth": 10,
+      "random_state": 42
+    }
+  },
+  
+  "intrusion_detector": {
+    "anomaly_threshold": 0.95,
+    "max_request_rate": 100,
+    "max_failed_logins": 5,
+    "isolation_forest": {
+      "n_estimators": 100,
+      "contamination": 0.01,
+      "random_state": 42
+    },
+    "random_forest": {
+      "n_estimators": 100,
+      "max_depth": 10,
+      "random_state": 42
+    },
+    "dbscan": {
+      "eps": 0.5,
+      "min_samples": 5
+    }
+  },
+  
+  "attack_signatures": {
+    "sql_injection": {
+      "pattern": {
+        "request_params": "*'OR 1=1*",
+        "endpoint": "*login*",
+        "method": "POST"
+      },
+      "severity": "critical"
+    },
+    "xss_attack": {
+      "pattern": {
+        "request_params": "*<script>*",
+        "method": "POST"
+      },
+      "severity": "high"
+    },
+    "path_traversal": {
+      "pattern": {
+        "request_params": "*../../../*",
+        "endpoint": "*file*"
+      },
+      "severity": "critical"
+    },
+    "brute_force": {
+      "pattern": {
+        "endpoint": "*login*",
+        "method": "POST",
+        "failed_attempts": {
+          "min": 5
+        }
+      },
+      "severity": "high"
+    },
+    "ddos_attack": {
+      "pattern": {
+        "request_count": {
+          "min": 1000
+        },
+        "distinct_endpoints": {
+          "min": 10
+        },
+        "time_window_seconds": 60
+      },
+      "severity": "critical"
+    }
+  },
+  
+  "ip_blacklist": [
+    "192.168.1.100",
+    "10.0.0.5",
+    "172.16.0.10"
+  ],
+  
+  "user_risk_thresholds": {
+    "low": 0.3,
+    "medium": 0.6,
+    "high": 0.8
+  },
+  
+  "model_performance_metrics": {
+    "anomaly_detector": {
+      "precision": 0.8,
+      "recall": 0.7,
+      "f1_score": 0.75
+    },
+    "root_cause_analyzer": {
+      "accuracy": 0.7,
+      "top_k_accuracy": 0.85
+    },
+    "predictive_alerting": {
+      "precision": 0.75,
+      "recall": 0.8,
+      "lead_time_hours": 24
+    },
+    "fraud_detector": {
+      "precision": 0.9,
+      "recall": 0.8,
+      "f1_score": 0.85,
+      "auc": 0.92
+    },
+    "inventory_optimizer": {
+      "mape": 15.0,
+      "rmse": 10.0,
+      "stockout_rate": 0.05
+    },
+    "intrusion_detector": {
+      "precision": 0.95,
+      "recall": 0.85,
+      "f1_score": 0.9,
+      "false_positive_rate": 0.01
+    }
+  }
+}

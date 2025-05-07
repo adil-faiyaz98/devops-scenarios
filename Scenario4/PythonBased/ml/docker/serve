@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+
+# This script is the entry point for the inference container
+
+import os
+import sys
+import json
+import traceback
+import flask
+import pandas as pd
+from io import StringIO
+
+# Add parent directory to path to import inference module
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from inference.inference import model_fn, input_fn, predict_fn, output_fn
+
+# The flask app for serving predictions
+app = flask.Flask(__name__)
+
+# Load the model
+model_dir = os.environ.get('MODEL_DIR', '/opt/ml/model')
+model = model_fn(model_dir)
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """
+    Health check endpoint.
+    """
+    # Check if the model is loaded
+    health = model is not None
+    
+    # Return 200 if healthy, 500 if not
+    status = 200 if health else 500
+    return flask.Response(response='\n', status=status, mimetype='application/json')
+
+@app.route('/invocations', methods=['POST'])
+def invocations():
+    """
+    Inference endpoint.
+    """
+    # Get the request content type
+    content_type = flask.request.content_type
+    
+    # Get the request body
+    request_body = flask.request.data.decode('utf-8')
+    
+    # Get the accept header
+    accept = flask.request.headers.get('Accept', 'application/json')
+    
+    try:
+        # Preprocess the input
+        input_data = input_fn(request_body, content_type)
+        
+        # Make predictions
+        predictions = predict_fn(input_data, model)
+        
+        # Postprocess the predictions
+        response_body, response_content_type = output_fn(predictions, accept)
+        
+        # Return the response
+        return flask.Response(response=response_body, status=200, mimetype=response_content_type)
+    
+    except Exception as e:
+        # Log the error
+        error_message = f"Error during inference: {str(e)}\n{traceback.format_exc()}"
+        print(error_message)
+        
+        # Return the error
+        return flask.Response(
+            response=json.dumps({"error": str(e)}),
+            status=500,
+            mimetype='application/json'
+        )
+
+if __name__ == '__main__':
+    # Run the server
+    app.run(host='0.0.0.0', port=8080)

@@ -1,0 +1,19 @@
+config:
+  aws:region: us-west-2
+  enterprise-multi-project-cicd:environment: dev
+  enterprise-multi-project-cicd:clusterName: enterprise-dev
+  enterprise-multi-project-cicd:nodeSize: t3.medium
+  enterprise-multi-project-cicd:minNodes: 3
+  enterprise-multi-project-cicd:maxNodes: 6
+  enterprise-multi-project-cicd:desiredCapacity: 3
+  enterprise-multi-project-cicd:regions:
+    - us-west-2
+  enterprise-multi-project-cicd:domain: dev.example.com
+  enterprise-multi-project-cicd:enableMonitoring: true
+  enterprise-multi-project-cicd:enableTracing: true
+  enterprise-multi-project-cicd:enableLogging: true
+  enterprise-multi-project-cicd:enableVault: true
+  enterprise-multi-project-cicd:enableNetworkPolicies: true
+  enterprise-multi-project-cicd:alertingEmail: devops@example.com
+  enterprise-multi-project-cicd:slackWebhook: 
+    secure: AAABAFiJ2y6Ux+Q9n0Xg/XaGWRrLxKIhwcYtFiJ2y6Ux+Q9n0Xg/XaGWRrLxKIhwcYt=

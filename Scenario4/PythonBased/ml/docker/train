@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# This script is the entry point for the training container
+
+set -e
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --isolation-forest-estimators)
+            ISOLATION_FOREST_ESTIMATORS="$2"
+            shift
+            shift
+            ;;
+        --isolation-forest-contamination)
+            ISOLATION_FOREST_CONTAMINATION="$2"
+            shift
+            shift
+            ;;
+        --prophet-changepoint-prior-scale)
+            PROPHET_CHANGEPOINT_PRIOR_SCALE="$2"
+            shift
+            shift
+            ;;
+        --prophet-seasonality-prior-scale)
+            PROPHET_SEASONALITY_PRIOR_SCALE="$2"
+            shift
+            shift
+            ;;
+        --dynamic-threshold-sensitivity)
+            DYNAMIC_THRESHOLD_SENSITIVITY="$2"
+            shift
+            shift
+            ;;
+        *)
+            # Unknown option
+            shift
+            ;;
+    esac
+done
+
+# Set default values if not provided
+ISOLATION_FOREST_ESTIMATORS=${ISOLATION_FOREST_ESTIMATORS:-100}
+ISOLATION_FOREST_CONTAMINATION=${ISOLATION_FOREST_CONTAMINATION:-0.01}
+PROPHET_CHANGEPOINT_PRIOR_SCALE=${PROPHET_CHANGEPOINT_PRIOR_SCALE:-0.05}
+PROPHET_SEASONALITY_PRIOR_SCALE=${PROPHET_SEASONALITY_PRIOR_SCALE:-10.0}
+DYNAMIC_THRESHOLD_SENSITIVITY=${DYNAMIC_THRESHOLD_SENSITIVITY:-3.0}
+
+# Print configuration
+echo "Starting training with the following configuration:"
+echo "  isolation_forest_estimators: $ISOLATION_FOREST_ESTIMATORS"
+echo "  isolation_forest_contamination: $ISOLATION_FOREST_CONTAMINATION"
+echo "  prophet_changepoint_prior_scale: $PROPHET_CHANGEPOINT_PRIOR_SCALE"
+echo "  prophet_seasonality_prior_scale: $PROPHET_SEASONALITY_PRIOR_SCALE"
+echo "  dynamic_threshold_sensitivity: $DYNAMIC_THRESHOLD_SENSITIVITY"
+
+# Run the training script
+python -m training.train \
+    --isolation-forest-estimators $ISOLATION_FOREST_ESTIMATORS \
+    --isolation-forest-contamination $ISOLATION_FOREST_CONTAMINATION \
+    --prophet-changepoint-prior-scale $PROPHET_CHANGEPOINT_PRIOR_SCALE \
+    --prophet-seasonality-prior-scale $PROPHET_SEASONALITY_PRIOR_SCALE \
+    --dynamic-threshold-sensitivity $DYNAMIC_THRESHOLD_SENSITIVITY
+
+# Exit with the same status as the training script
+exit $?
